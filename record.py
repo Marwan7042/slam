@@ -34,6 +34,7 @@ IR_DOT_BRIGHTNESS  = CFG["hardware"]["ir_dot_brightness_ma"]
 LOCK_EXPOSURE      = CFG["hardware"]["lock_exposure"]
 EXPOSURE_TIME_US   = CFG["hardware"]["exposure_time_us"]
 ISO_SENSITIVITY    = CFG["hardware"]["iso_sensitivity"]
+CALIBRATION_MODE   = CFG.get("hardware", {}).get("calibration_mode", "factory").lower()
 
 GATE_MIN_FRAME_GAP   = CFG["keyframe_gating"]["min_frame_gap"]
 GATE_MAX_FRAME_GAP   = CFG["keyframe_gating"]["max_frame_gap"]
@@ -320,14 +321,16 @@ disk_thread.start()
 pipeline = dai.Pipeline()
 
 calib = None
-cal_source = "CUSTOM"
-try:
-    with dai.Device() as temp_device:
-        calib = temp_device.readFactoryCalibration()
-        cal_source = "FACTORY"
-        print("[CAL] ✓ Factory calibration loaded")
-except Exception as e:
-    print(f"[CAL] ⚠ Factory cal not available: {e}")
+cal_source = "UNKNOWN"
+
+if CALIBRATION_MODE == "factory":
+    try:
+        with dai.Device() as temp_device:
+            calib = temp_device.readFactoryCalibration()
+            cal_source = "FACTORY"
+            print("[CAL] ✓ Factory calibration loaded (as requested in config)")
+    except Exception as e:
+        print(f"[CAL] ⚠ Factory cal requested but not available: {e}. Falling back.")
 
 if calib is not None:
     pipeline.setCalibrationData(calib)
@@ -452,8 +455,12 @@ with dai.Device(pipeline) as device:
             print(f"[HW] ⚠ IR Projector NOT SUPPORTED on this model. (Running Passive Stereo)")
 
     if calib is None:
-        calib = device.readCalibration()
-        print("[CAL] Using current device calibration (custom)")
+        try:
+            calib = device.readCalibration()
+            cal_source = "CUSTOM (EEPROM)"
+            print("[CAL] ✓ Using custom device EEPROM calibration (as requested or fallback)")
+        except Exception as e:
+            print(f"[CAL] ⚠ Could not read any calibration: {e}")
 
     intr = calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, ISP_WIDTH, ISP_HEIGHT)
     K_mat = np.array([

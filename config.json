@@ -3,6 +3,7 @@
         "scan_dir": "./coral_scan"
     },
     "hardware": {
+        "calibration_mode": "custom",
         "target_fps": 10,
         "imu_rate_hz": 200,
         "use_ir_projector": true,
