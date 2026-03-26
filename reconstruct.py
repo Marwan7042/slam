@@ -830,6 +830,14 @@ def eval_candidate(i, ti, sd, sd_fpfh, dyn_dist):
         
     td, td_fpfh = td_data
     
+    # --- FIX 3: DEGENERACY GATE ---
+    # Reject loops on flat/featureless geometry where ICP will slide
+    dist_s = compute_cloud_distinctiveness(sd)
+    dist_t = compute_cloud_distinctiveness(td)
+    if dist_s < APERTURE_DISTINCTIVENESS_THR or dist_t < APERTURE_DISTINCTIVENESS_THR:
+        return None
+    # ------------------------------
+    
     try:
         fgr_result = o3d.pipelines.registration.registration_fgr_based_on_feature_matching(
             sd, td, sd_fpfh, td_fpfh,

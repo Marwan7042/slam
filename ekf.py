@@ -255,6 +255,14 @@ class VIO_EKF:
         R_p_c = R_c_p.T
         t_p_c = (-R_p_c @ tvec).flatten()
         
+        # --- FIX 2: DYNAMIC NOISE SCALING ---
+        # Calculate the mean depth of the valid inliers
+        inlier_idx = inliers.flatten()
+        mean_depth = float(np.mean(d_val[inlier_idx]))
+        
+        # Uncertainty grows quadratically with depth. (Base line is 1.0 meters)
+        depth_scale = max(1.0, mean_depth**2)
+        
         with self._lock:
             if self._last_v_p is None:
                 self._last_v_p = self.p.copy()
@@ -278,9 +286,21 @@ class VIO_EKF:
             H[:3, :3] = self._I3
             H[3:6, 6:9] = self._I3
             
-            S = H @ self.P @ H.T + self._R_vis
+            # Apply dynamic scaling to the position coordinates of R_vis
+            R_vis_dyn = self._R_vis.copy()
+            R_vis_dyn[0, 0] *= depth_scale
+            R_vis_dyn[1, 1] *= depth_scale
+            R_vis_dyn[2, 2] *= depth_scale
+            
+            S = H @ self.P @ H.T + R_vis_dyn
             try: Si = np.linalg.inv(S)
             except Exception: return False, ni
+            
+            # --- FIX 1: MAHALANOBIS GATE ---
+            # For 6 Degrees of Freedom, the 95% confidence chi-square threshold is 12.59
+            mahalanobis_sq = innov.T @ Si @ innov
+            if mahalanobis_sq > 12.59:
+                return False, ni # Reject: Statistically anomalous measurement
             
             K_gain = self.P @ H.T @ Si
             dx = K_gain @ innov
@@ -292,7 +312,7 @@ class VIO_EKF:
             self.ba += dx[9:12]; self.bg += dx[12:15]
             
             IKH = self._I15 - K_gain @ H
-            self.P[:] = IKH @ self.P @ IKH.T + K_gain @ self._R_vis @ K_gain.T
+            self.P[:] = IKH @ self.P @ IKH.T + K_gain @ R_vis_dyn @ K_gain.T
             _symmetrise_15(self.P)
             
             self._last_v_p = self.p.copy()

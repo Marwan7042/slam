@@ -57,6 +57,16 @@ CR_REC = CR_CFG.get("apply_to_recording", True)
 ISP_WIDTH  = 960
 ISP_HEIGHT = 540
 
+# --- OPTICAL FLOW FALLBACK PARAMS ---
+lk_params = dict(winSize=(21, 21),
+                 maxLevel=3,
+                 criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+
+feature_params = dict(maxCorners=100,
+                      qualityLevel=0.05,
+                      minDistance=10,
+                      blockSize=7)
+
 # ============================================================
 # SHARED STATE & BUFFERS
 # ============================================================
@@ -66,7 +76,7 @@ recording_event = threading.Event()
 visual_queue = queue.Queue(maxsize=1)
 stop_event   = threading.Event()
 
-# FIX: CAMERA CONTROL STATE DICT (Mutable & Thread-Safe)
+# CAMERA CONTROL STATE DICT (Mutable & Thread-Safe)
 cam_ctrl_lock = threading.Lock()
 cam_state = {
     "wb": 4600,
@@ -81,7 +91,8 @@ hud_telemetry = {
     "score": 1.0,
     "blur": 0.0,
     "depth_pct": 0.0,
-    "message": "AWAITING GRAVITY CALIBRATION"
+    "message": "AWAITING GRAVITY CALIBRATION",
+    "cpu_fallback": False # <--- Tracks if CPU LK Optical Flow is engaged
 }
 hud_lock = threading.Lock()
 runtime_state = {"bad_streak_counter": 0} 
@@ -210,6 +221,10 @@ class MJPEGHandler(http.server.BaseHTTPRequestHandler):
                         cv2.putText(frame, f"STATE: {telem['state']}", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
                         cv2.putText(frame, f"BLUR: {telem['blur']:.1f}px", (15, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                         cv2.putText(frame, f"DEPTH: {telem['depth_pct']*100:.1f}%", (15, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                        
+                        # CPU Fallback Warning
+                        if telem.get("cpu_fallback"):
+                            cv2.putText(frame, "CPU OPTICAL FLOW ACTIVE", (15, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
                         
                         if recording_event.is_set():
                             cv2.putText(frame, "REC", (w - 80, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
@@ -487,6 +502,11 @@ with dai.Device(pipeline) as device:
     current_applied_exp = 0
     current_applied_iso = 0
 
+    # CPU Fallback Trackers
+    gray_curr = None
+    prev_gray = None
+    fallback_pts_prev = None
+
     print(f"\n[EKF] Hold still for gravity calibration...")
 
     has_tty = False
@@ -561,6 +581,10 @@ with dai.Device(pipeline) as device:
             if sy:
                 raw_rgb = sy["rgb"].getCvFrame()
                 dep = sy["depth"].getFrame().astype(np.uint16)
+                
+                # --- CPU FALLBACK PREP ---
+                gray_curr = cv2.cvtColor(raw_rgb, cv2.COLOR_BGR2GRAY)
+                # -------------------------
                 
                 # Apply configurable color restoration to Recording
                 if CR_ENABLED and CR_REC:
@@ -706,24 +730,73 @@ with dai.Device(pipeline) as device:
                             print(f"  [{count:04d} | idx:{ekf_frame_counter}] "
                                   f"Health: {quality_score:.2f} ({quality_state}) | {reason}")
 
+            # --- HARDWARE + CPU FALLBACK TRACKING ---
             fm = qf.tryGet()
-            if fm:
+            if fm and gray_curr is not None:
                 cf = {t.id:(float(t.position.x),float(t.position.y)) for t in fm.trackedFeatures}
                 ds_curr = depth_dbuf.read() if depth_dbuf else None
                 
+                hw_features_sent = False
+                cpu_fallback_active = False
+
+                # 1. TRY HARDWARE TRACKER FIRST
                 if prev_fd and prev_depth is not None and ekf.is_ready():
                     pp, pc = [], []
                     for fid, c in cf.items():
                         if fid in prev_fd: 
                             pp.append(prev_fd[fid])
                             pc.append(c)
+                            
                     if len(pp) >= MIN_FEAT_UPDATE:
                         try: 
                             visual_queue.put_nowait((np.array(pp), np.array(pc), prev_depth))
+                            hw_features_sent = True
+                            
+                            # Keep our fallback points updated with the healthy hardware points
+                            fallback_pts_prev = np.array(pc, dtype=np.float32).reshape(-1, 1, 2)
                         except queue.Full: 
                             pass
                 
+                # 2. TRIGGER CPU FALLBACK IF HARDWARE FAILS
+                if not hw_features_sent and prev_gray is not None and ekf.is_ready():
+                    cpu_fallback_active = True
+                    # Check if we have points to track from the previous frame
+                    if fallback_pts_prev is not None and len(fallback_pts_prev) > 0:
+                        # Calculate optical flow
+                        p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_curr, fallback_pts_prev, None, **lk_params)
+                        
+                        # Select good points
+                        if p1 is not None and st is not None:
+                            good_new = p1[st == 1]
+                            good_old = fallback_pts_prev[st == 1]
+                            
+                            if len(good_new) >= MIN_FEAT_UPDATE:
+                                try:
+                                    # Send the CPU-tracked features to the EKF
+                                    visual_queue.put_nowait((good_old, good_new, prev_depth))
+                                    fallback_pts_prev = good_new.reshape(-1, 1, 2)
+                                    print("  [WARN] VPU Tracker dropped! CPU Optical Flow engaged.")
+                                except queue.Full:
+                                    pass
+                            else:
+                                # Total tracking loss. Re-detect features from scratch for the next frame.
+                                new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
+                                fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
+                        else:
+                            new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
+                            fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
+                    else:
+                        # We didn't have valid points to start with, re-seed.
+                        new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
+                        fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
+                
+                # Update HUD with CPU Fallback status
+                with hud_lock:
+                    hud_telemetry["cpu_fallback"] = cpu_fallback_active
+                
+                # Update states for the next loop iteration
                 prev_fd = cf
+                prev_gray = gray_curr.copy()
                 
                 if ds_curr is not None:
                     valid_ratio = float(np.count_nonzero(ds_curr)) / ds_curr.size
