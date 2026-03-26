@@ -400,12 +400,6 @@ feat = pipeline.create(dai.node.FeatureTracker)
 feat.setHardwareResources(1, 1)
 cam.isp.link(feat.inputImage)
 
-xout_f = pipeline.create(dai.node.XLinkOut)
-xout_f.setStreamName("features")
-xout_f.input.setBlocking(False)
-xout_f.input.setQueueSize(2)
-feat.outputFeatures.link(xout_f.input)
-
 imu_n = pipeline.create(dai.node.IMU)
 imu_n.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], reportRate=IMU_RATE)
 imu_n.setBatchReportThreshold(5)
@@ -417,14 +411,19 @@ xout_i.input.setBlocking(False)
 xout_i.input.setQueueSize(10)
 imu_n.out.link(xout_i.input)
 
+# --- THE GRANDMASTER FIX: PERFECT HARDWARE SYNCHRONIZATION ---
 sync = pipeline.create(dai.node.Sync)
 sync.setSyncThreshold(timedelta(milliseconds=30))
 sync.inputs["rgb"].setBlocking(False)
 sync.inputs["rgb"].setQueueSize(2)
 sync.inputs["depth"].setBlocking(False)
 sync.inputs["depth"].setQueueSize(2)
+sync.inputs["features"].setBlocking(False)
+sync.inputs["features"].setQueueSize(2)
+
 cam.isp.link(sync.inputs["rgb"])
 stereo.depth.link(sync.inputs["depth"])
+feat.outputFeatures.link(sync.inputs["features"])
 
 xout_s = pipeline.create(dai.node.XLinkOut)
 xout_s.setStreamName("synced")
@@ -485,7 +484,6 @@ with dai.Device(pipeline) as device:
     vis_t.start()
 
     qs = device.getOutputQueue("synced", 4, False)
-    qf = device.getOutputQueue("features", 4, False)
     qj = device.getOutputQueue("mjpeg", 2, False) 
     qp = device.getOutputQueue("preview", 2, False) 
     control_q = device.getInputQueue("control")
@@ -581,6 +579,7 @@ with dai.Device(pipeline) as device:
             if sy:
                 raw_rgb = sy["rgb"].getCvFrame()
                 dep = sy["depth"].getFrame().astype(np.uint16)
+                fm = sy["features"]
                 
                 # --- CPU FALLBACK PREP ---
                 gray_curr = cv2.cvtColor(raw_rgb, cv2.COLOR_BGR2GRAY)
@@ -730,78 +729,81 @@ with dai.Device(pipeline) as device:
                             print(f"  [{count:04d} | idx:{ekf_frame_counter}] "
                                   f"Health: {quality_score:.2f} ({quality_state}) | {reason}")
 
-            # --- HARDWARE + CPU FALLBACK TRACKING ---
-            fm = qf.tryGet()
-            if fm and gray_curr is not None:
-                cf = {t.id:(float(t.position.x),float(t.position.y)) for t in fm.trackedFeatures}
-                ds_curr = depth_dbuf.read() if depth_dbuf else None
-                
-                hw_features_sent = False
-                cpu_fallback_active = False
+                # --- HARDWARE + CPU FALLBACK TRACKING ---
+                if fm and gray_curr is not None:
+                    cf = {t.id:(float(t.position.x),float(t.position.y)) for t in fm.trackedFeatures}
+                    ds_curr = depth_dbuf.read() if depth_dbuf else None
+                    
+                    hw_features_sent = False
+                    cpu_fallback_active = False
 
-                # 1. TRY HARDWARE TRACKER FIRST
-                if prev_fd and prev_depth is not None and ekf.is_ready():
-                    pp, pc = [], []
-                    for fid, c in cf.items():
-                        if fid in prev_fd: 
-                            pp.append(prev_fd[fid])
-                            pc.append(c)
+                    # 1. TRY HARDWARE TRACKER FIRST
+                    if prev_fd and prev_depth is not None and ekf.is_ready():
+                        pp, pc = [], []
+                        for fid, c in cf.items():
+                            if fid in prev_fd: 
+                                pp.append(prev_fd[fid])
+                                pc.append(c)
+                                
+                        if len(pp) >= MIN_FEAT_UPDATE:
+                            try: 
+                                # GRANDMASTER FIX: Explicitly cast hardware points to float32 
+                                # to prevent cv2.calcOpticalFlowPyrLK from crashing on float64 arrays
+                                pp_arr = np.array(pp, dtype=np.float32)
+                                pc_arr = np.array(pc, dtype=np.float32)
+                                visual_queue.put_nowait((pp_arr, pc_arr, prev_depth))
+                                hw_features_sent = True
+                                
+                                # Keep our fallback points updated with the healthy hardware points
+                                fallback_pts_prev = pc_arr.reshape(-1, 1, 2)
+                            except queue.Full: 
+                                pass
+                    
+                    # 2. TRIGGER CPU FALLBACK IF HARDWARE FAILS
+                    if not hw_features_sent and prev_gray is not None and ekf.is_ready():
+                        cpu_fallback_active = True
+                        # Check if we have points to track from the previous frame
+                        if fallback_pts_prev is not None and len(fallback_pts_prev) > 0:
+                            # Calculate optical flow
+                            p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_curr, fallback_pts_prev, None, **lk_params)
                             
-                    if len(pp) >= MIN_FEAT_UPDATE:
-                        try: 
-                            visual_queue.put_nowait((np.array(pp), np.array(pc), prev_depth))
-                            hw_features_sent = True
-                            
-                            # Keep our fallback points updated with the healthy hardware points
-                            fallback_pts_prev = np.array(pc, dtype=np.float32).reshape(-1, 1, 2)
-                        except queue.Full: 
-                            pass
-                
-                # 2. TRIGGER CPU FALLBACK IF HARDWARE FAILS
-                if not hw_features_sent and prev_gray is not None and ekf.is_ready():
-                    cpu_fallback_active = True
-                    # Check if we have points to track from the previous frame
-                    if fallback_pts_prev is not None and len(fallback_pts_prev) > 0:
-                        # Calculate optical flow
-                        p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_curr, fallback_pts_prev, None, **lk_params)
-                        
-                        # Select good points
-                        if p1 is not None and st is not None:
-                            good_new = p1[st == 1]
-                            good_old = fallback_pts_prev[st == 1]
-                            
-                            if len(good_new) >= MIN_FEAT_UPDATE:
-                                try:
-                                    # Send the CPU-tracked features to the EKF
-                                    visual_queue.put_nowait((good_old, good_new, prev_depth))
-                                    fallback_pts_prev = good_new.reshape(-1, 1, 2)
-                                    print("  [WARN] VPU Tracker dropped! CPU Optical Flow engaged.")
-                                except queue.Full:
-                                    pass
+                            # Select good points
+                            if p1 is not None and st is not None:
+                                good_new = p1[st == 1]
+                                good_old = fallback_pts_prev[st == 1]
+                                
+                                if len(good_new) >= MIN_FEAT_UPDATE:
+                                    try:
+                                        # Send the CPU-tracked features to the EKF
+                                        visual_queue.put_nowait((good_old, good_new, prev_depth))
+                                        fallback_pts_prev = good_new.reshape(-1, 1, 2)
+                                        print("  [WARN] VPU Tracker dropped! CPU Optical Flow engaged.")
+                                    except queue.Full:
+                                        pass
+                                else:
+                                    # Total tracking loss. Re-detect features from scratch for the next frame.
+                                    new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
+                                    fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
                             else:
-                                # Total tracking loss. Re-detect features from scratch for the next frame.
                                 new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
                                 fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
                         else:
+                            # We didn't have valid points to start with, re-seed.
                             new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
                             fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
-                    else:
-                        # We didn't have valid points to start with, re-seed.
-                        new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
-                        fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
-                
-                # Update HUD with CPU Fallback status
-                with hud_lock:
-                    hud_telemetry["cpu_fallback"] = cpu_fallback_active
-                
-                # Update states for the next loop iteration
-                prev_fd = cf
-                prev_gray = gray_curr.copy()
-                
-                if ds_curr is not None:
-                    valid_ratio = float(np.count_nonzero(ds_curr)) / ds_curr.size
-                    if valid_ratio > 0.15:
-                        prev_depth = ds_curr.copy()
+                    
+                    # Update HUD with CPU Fallback status
+                    with hud_lock:
+                        hud_telemetry["cpu_fallback"] = cpu_fallback_active
+                    
+                    # Update states for the next loop iteration
+                    prev_fd = cf
+                    prev_gray = gray_curr.copy()
+                    
+                    if ds_curr is not None:
+                        valid_ratio = float(np.count_nonzero(ds_curr)) / ds_curr.size
+                        if valid_ratio > 0.15:
+                            prev_depth = ds_curr.copy()
 
             time.sleep(0.001)
 
@@ -810,7 +812,16 @@ with dai.Device(pipeline) as device:
     finally:
         stop_event.set()
         recording_event.clear()
+        
+        # GRANDMASTER FIX: Flush queues before inserting poison pill to avoid infinite deadlocks
+        while not visual_queue.empty():
+            try: visual_queue.get_nowait()
+            except: break
         visual_queue.put(None)
+        
+        while not disk_queue.empty():
+            try: disk_queue.get_nowait()
+            except: break
         disk_queue.put(None)
 
         imu_t.join(timeout=2.0)

@@ -206,11 +206,12 @@ if n_frames < 2:
     raise RuntimeError("Need ≥2 frames to reconstruct.")
 
 # ============================================================
-# ZERO-COPY iGPU & CPU LOADERS 
+# ZERO-COPY iGPU & CPU LOADERS (THREAD SAFE)
 # ============================================================
 ACTIVE_LOADER_MODE = "CPU"
 
 _thread_local = threading.local()
+_igpu_lock = threading.Lock()  # GRANDMASTER FIX: Prevents cv2.UMat segfaults across threads
 
 def get_clahe():
     if not hasattr(_thread_local, "clahe"):
@@ -224,27 +225,29 @@ def _loader_igpu(rgb_path, depth_path, quantile=0.0):
     if rgb_raw is None or depth_raw is None:
         return None, None
 
-    rgb_gpu = cv2.UMat(rgb_raw)
-    depth_gpu = cv2.UMat(depth_raw)
+    # Locking OpenCL Context Operations to prevent thread collision segfaults
+    with _igpu_lock:
+        rgb_gpu = cv2.UMat(rgb_raw)
+        depth_gpu = cv2.UMat(depth_raw)
 
-    lab_gpu = cv2.cvtColor(rgb_gpu, cv2.COLOR_BGR2LAB)
-    l_gpu, a_gpu, b_gpu = cv2.split(lab_gpu)
-    
-    clahe = get_clahe()
-    l_clahe = clahe.apply(l_gpu)
-    
-    lab_clahe = cv2.merge([l_clahe, a_gpu, b_gpu])
-    rgb_gpu_eq = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
+        lab_gpu = cv2.cvtColor(rgb_gpu, cv2.COLOR_BGR2LAB)
+        l_gpu, a_gpu, b_gpu = cv2.split(lab_gpu)
+        
+        clahe = get_clahe()
+        l_clahe = clahe.apply(l_gpu)
+        
+        lab_clahe = cv2.merge([l_clahe, a_gpu, b_gpu])
+        rgb_gpu_eq = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
 
-    if DECIMATE_FACTOR > 1:
-        rgb_resized = cv2.resize(rgb_gpu_eq, (W, H), interpolation=cv2.INTER_AREA)
-        depth_resized = cv2.resize(depth_gpu, (W, H), interpolation=cv2.INTER_NEAREST)
-    else:
-        rgb_resized = rgb_gpu_eq
-        depth_resized = depth_gpu
+        if DECIMATE_FACTOR > 1:
+            rgb_resized = cv2.resize(rgb_gpu_eq, (W, H), interpolation=cv2.INTER_AREA)
+            depth_resized = cv2.resize(depth_gpu, (W, H), interpolation=cv2.INTER_NEAREST)
+        else:
+            rgb_resized = rgb_gpu_eq
+            depth_resized = depth_gpu
 
-    rgb_final = cv2.cvtColor(rgb_resized.get(), cv2.COLOR_BGR2RGB)
-    depth_final = depth_resized.get()
+        rgb_final = cv2.cvtColor(rgb_resized.get(), cv2.COLOR_BGR2RGB)
+        depth_final = depth_resized.get()
 
     if quantile > 0.0 and quantile < 1.0:
         valid = depth_final[depth_final > 0]
@@ -398,10 +401,20 @@ if USE_VO and not HAS_CUDA:
 # MATH & CLOUD HELPERS
 # ============================================================
 def cov2info(c6, sc=IMU_INFO_SCALE):
+    # --- GRANDMASTER FIX: COVARIANCE ORDERING BOMB ---
+    # EKF outputs Covariance in [Translation, Rotation] order (X,Y,Z, r,p,y).
+    # Open3D's Global Optimizer absolutely requires [Rotation, Translation] order.
+    # We must mathematically swap the quadrants before inversion.
+    c6_o3d = np.zeros((6, 6), dtype=np.float64)
+    c6_o3d[:3, :3] = c6[3:6, 3:6]   # Top-Left: Rotation Covariance
+    c6_o3d[3:6, 3:6] = c6[:3, :3]   # Bottom-Right: Translation Covariance
+    c6_o3d[:3, 3:6] = c6[3:6, :3]   # Top-Right: Cross-Covariance
+    c6_o3d[3:6, :3] = c6[:3, 3:6]   # Bottom-Left: Cross-Covariance
+    
     if HAS_NUMBA: 
-        info = _inv6(c6, 1e-6)
+        info = _inv6(c6_o3d, 1e-6)
     else: 
-        info = np.linalg.inv(c6 + np.eye(6) * 1e-6)
+        info = np.linalg.inv(c6_o3d + np.eye(6) * 1e-6)
         
     info = 0.5 * (info + info.T)
     evals, evecs = np.linalg.eigh(info)
@@ -584,7 +597,8 @@ def _colored_icp_refine(src, tgt, fine_dist, init_T):
         return init_T, -1.0, -1.0
 
 def tracking_icp(src, tgt, fine_dist, init_T=None):
-    if src is None or tgt is None: 
+    # GRANDMASTER FIX: Guard against assert failures on empty/stripped point clouds
+    if src is None or tgt is None or len(src.points) < 30 or len(tgt.points) < 30: 
         return np.eye(4), 0.0, 1.0
         
     if init_T is None: 
@@ -606,7 +620,7 @@ def tracking_icp(src, tgt, fine_dist, init_T=None):
     return T, fit, rmse
 
 def tracking_icp_retry(src, tgt, fine_dist, init_T):
-    if src is None or tgt is None:
+    if src is None or tgt is None or len(src.points) < 30 or len(tgt.points) < 30:
         return init_T, 0.0, 1.0, False
 
     T, f, r = tracking_icp(src, tgt, fine_dist, init_T)
@@ -631,7 +645,7 @@ def tracking_icp_retry(src, tgt, fine_dist, init_T):
     return init_T, max(f, f2), min(r, r2), False
 
 def loop_icp(src, tgt, fine_dist, T_init=None):
-    if src is None or tgt is None: 
+    if src is None or tgt is None or len(src.points) < 30 or len(tgt.points) < 30: 
         return np.eye(4), 0.0, 1.0
         
     if T_init is None: 

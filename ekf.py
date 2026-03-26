@@ -66,11 +66,20 @@ def _build_F_and_Qd_jit(F,Qd,R,a_b,w_b,dt,na_var,ng_var,nba_var,nbg_var):
         for j in range(15): F[i,j]=0.0;Qd[i,j]=0.0
         F[i,i]=1.0
     F[0,3]=dt;F[1,4]=dt;F[2,5]=dt;ax,ay,az=a_b[0],a_b[1],a_b[2]
+    
+    # --- GRANDMASTER FIX: VELOCITY JACOBIAN SIGN ERROR ---
+    # In a local error state, d_vdot / d_phi = - R * [a_b]x
+    # c0, c1, c2 correctly compute the columns of (- R * [a_b]x).
+    # Previous code multiplied these by -dt, flipping the Jacobian to (+ R * [a_b]x), causing divergence.
     for i in range(3):
-        c0=-R[i,1]*az+R[i,2]*ay;c1=R[i,0]*az-R[i,2]*ax;c2=-R[i,0]*ay+R[i,1]*ax
-        F[3+i,6]=-c0*dt;F[3+i,7]=-c1*dt;F[3+i,8]=-c2*dt
-    for i in range(3):
-        for j in range(3): F[3+i,9+j]=-R[i,j]*dt
+        c0 = -R[i,1]*az + R[i,2]*ay
+        c1 =  R[i,0]*az - R[i,2]*ax
+        c2 = -R[i,0]*ay + R[i,1]*ax
+        F[3+i, 6] = c0*dt
+        F[3+i, 7] = c1*dt
+        F[3+i, 8] = c2*dt
+    # -----------------------------------------------------
+
     wx,wy,wz=w_b[0],w_b[1],w_b[2]
     F[6,6]=1.0;F[6,7]=wz*dt;F[6,8]=-wy*dt;F[7,6]=-wz*dt;F[7,7]=1.0;F[7,8]=wx*dt;F[8,6]=wy*dt;F[8,7]=-wx*dt;F[8,8]=1.0
     F[6,12]=-dt;F[7,13]=-dt;F[8,14]=-dt
@@ -218,7 +227,8 @@ class VIO_EKF:
         with self._lock: 
             return self._w_b.copy()
 
-    def update_visual(self, pts_p, pts_c, depth_p, K):
+    # --- RESTORED: T_ic and T_ci explicitly passed in from record.py ---
+    def update_visual(self, pts_p, pts_c, depth_p, K, T_ic, T_ci):
         if len(pts_p) < MIN_FEAT_UPDATE: 
             return False, 0
         
@@ -254,13 +264,21 @@ class VIO_EKF:
         R_c_p, _ = cv2.Rodrigues(rvec)
         R_p_c = R_c_p.T
         t_p_c = (-R_p_c @ tvec).flatten()
+
+        # --- GRANDMASTER FIX: EXTRINSIC FRAME ALIGNMENT ---
+        # Transform the relative Camera motion into relative IMU motion
+        T_c_curr_c_prev = np.eye(4)
+        T_c_curr_c_prev[:3, :3] = R_p_c
+        T_c_curr_c_prev[:3, 3] = t_p_c
+
+        # T_{I_curr}^{I_prev} = T_{I}^{C} * T_{C_curr}^{C_prev} * T_{C}^{I}
+        T_i_curr_i_prev = T_ic @ T_c_curr_c_prev @ T_ci
+        R_p_c_imu = T_i_curr_i_prev[:3, :3]
+        t_p_c_imu = T_i_curr_i_prev[:3, 3]
         
-        # --- FIX 2: DYNAMIC NOISE SCALING ---
-        # Calculate the mean depth of the valid inliers
+        # --- RESTORED: DYNAMIC NOISE SCALING ---
         inlier_idx = inliers.flatten()
         mean_depth = float(np.mean(d_val[inlier_idx]))
-        
-        # Uncertainty grows quadratically with depth. (Base line is 1.0 meters)
         depth_scale = max(1.0, mean_depth**2)
         
         with self._lock:
@@ -269,24 +287,27 @@ class VIO_EKF:
                 self._last_v_R = self.R.copy()
                 return True, ni
                 
-            t_meas_world = self._last_v_p + (self._last_v_R @ t_p_c)
+            t_meas_world = self._last_v_p + (self._last_v_R @ t_p_c_imu)
             dpi_world = t_meas_world - self.p
             
-            R_meas_world = self._last_v_R @ R_p_c
-            R_err = R_meas_world @ self.R.T
-            dphi_world = _mat_to_rotvec_jit(R_err)
+            R_meas_world = self._last_v_R @ R_p_c_imu
             
-            innov = np.concatenate([dpi_world, dphi_world])
+            # --- GRANDMASTER FIX: PURE LOCAL ERROR STATE FORMULATION ---
+            # To match the F matrix, error state must be R_err = R_pred.T @ R_meas
+            R_err = self.R.T @ R_meas_world
+            dphi_body = _mat_to_rotvec_jit(R_err)
+            
+            innov = np.concatenate([dpi_world, dphi_body])
             
             trans_err_m = float(np.linalg.norm(dpi_world))
-            rot_err_deg = float(np.linalg.norm(dphi_world)) * (180.0 / math.pi)
+            rot_err_deg = float(np.linalg.norm(dphi_body)) * (180.0 / math.pi)
             self.residual_log.append({"tick": self._step_count, "inliers": ni, "trans_err_m": trans_err_m, "rot_err_deg": rot_err_deg})
             
             H = np.zeros((6, 15))
             H[:3, :3] = self._I3
             H[3:6, 6:9] = self._I3
             
-            # Apply dynamic scaling to the position coordinates of R_vis
+            # Apply dynamic scaling to the visual noise matrix
             R_vis_dyn = self._R_vis.copy()
             R_vis_dyn[0, 0] *= depth_scale
             R_vis_dyn[1, 1] *= depth_scale
@@ -296,19 +317,22 @@ class VIO_EKF:
             try: Si = np.linalg.inv(S)
             except Exception: return False, ni
             
-            # --- FIX 1: MAHALANOBIS GATE ---
-            # For 6 Degrees of Freedom, the 95% confidence chi-square threshold is 12.59
+            # --- RESTORED: MAHALANOBIS GATE ---
             mahalanobis_sq = innov.T @ Si @ innov
             if mahalanobis_sq > 12.59:
-                return False, ni # Reject: Statistically anomalous measurement
+                return False, ni 
             
             K_gain = self.P @ H.T @ Si
             dx = K_gain @ innov
             
             self.p += dx[:3]; self.v += dx[3:6]
             _rodrigues_jit(dx[6], dx[7], dx[8], self._tmp33)
-            _mat3_mul(self._tmp33, self.R, self._dR)
+            
+            # --- GRANDMASTER FIX: RIGHT-MULTIPLY LOCAL UPDATE ---
+            # R_new = R_old * Delta_R  (Matches local error formulation)
+            _mat3_mul(self.R, self._tmp33, self._dR)
             self.R[:] = self._dR
+            
             self.ba += dx[9:12]; self.bg += dx[12:15]
             
             IKH = self._I15 - K_gain @ H

@@ -1,6 +1,6 @@
 {
     "paths": {
-        "scan_dir": "./coral_scan2"
+        "scan_dir": "./coral_scan"
     },
     "hardware": {
         "target_fps": 10,
