@@ -529,6 +529,14 @@ with dai.Device(pipeline) as device:
 
     last_calib_print = 0
     last_heartbeat = time.time()
+    
+    # --- ARMOR: TELEMETRY COUNTERS ---
+    telemetry_stats = {
+        "visual_queue_drops": 0,
+        "disk_queue_drops": 0,
+        "forced_gaps_accepted": 0,
+        "cpu_fallback_engagements": 0
+    }
 
     try:
         while True:
@@ -640,12 +648,15 @@ with dai.Device(pipeline) as device:
                     valid_ratio = 0.0
                     blur_pixels = 0.0
                     evaluated_for_hud = False
+                    is_forced_gap = False
                     
                     quality_score = 1.0       
                     quality_state = "GOOD"
 
                     if gap >= GATE_MAX_FRAME_GAP:
                         accept = True
+                        is_forced_gap = True
+                        telemetry_stats["forced_gaps_accepted"] += 1
                         reason = f"forced_gap({gap})"
                         valid_ratio = float(np.count_nonzero(dep)) / dep.size
                         w_b = ekf.get_angular_velocity()
@@ -683,11 +694,19 @@ with dai.Device(pipeline) as device:
                         good_thresh = qc_cfg.get("score_good_threshold", 0.75)
                         weak_thresh = qc_cfg.get("score_weak_threshold", 0.40)
                         
+                        # --- ARMOR: MISSION-AWARE QUALITY WEIGHTS ---
+                        w_depth = qc_cfg.get("weight_depth", 0.6) 
+                        w_blur = qc_cfg.get("weight_blur", 0.4)
+                        
                         q_depth = min(1.0, valid_ratio / ideal_depth) if ideal_depth > 0 else 0
                         q_blur  = max(0.0, 1.0 - (blur_pixels / severe_blur)) if severe_blur > 0 else 0
-                        quality_score = (q_depth * 0.5) + (q_blur * 0.5)
+                        quality_score = (q_depth * w_depth) + (q_blur * w_blur)
                         
-                        if quality_score >= good_thresh:
+                        # --- ARMOR: FORCED-GAP DOWNWEIGHTING ---
+                        if is_forced_gap:
+                            quality_state = "WEAK"
+                            quality_score = min(quality_score, weak_thresh)
+                        elif quality_score >= good_thresh:
                             quality_state = "GOOD"
                         elif quality_score >= weak_thresh:
                             quality_state = "WEAK"
@@ -728,6 +747,7 @@ with dai.Device(pipeline) as device:
                             "gate_reason": reason,
                             "quality_score": float(quality_score),
                             "quality_state": quality_state,
+                            "is_forced_gap": is_forced_gap, # Saved for offline graph to safely downweight
                             "pose": Tc.tolist(),
                             "cov6": cov6.tolist()
                         })
@@ -736,6 +756,7 @@ with dai.Device(pipeline) as device:
                             disk_queue.put_nowait((os.path.join(RGB_DIR, f"{count:04d}.jpg"), rgb_to_save))
                             disk_queue.put_nowait((os.path.join(DEPTH_DIR, f"{count:04d}.png"), dep))
                         except queue.Full:
+                            telemetry_stats["disk_queue_drops"] += 1
                             print("[WARN] Disk queue full, dropping save frame!")
                             
                         count += 1
@@ -768,6 +789,7 @@ with dai.Device(pipeline) as device:
                                 hw_features_sent = True
                                 fallback_pts_prev = pc_arr.reshape(-1, 1, 2)
                             except queue.Full: 
+                                telemetry_stats["visual_queue_drops"] += 1
                                 pass
                     
                     if not hw_features_sent and prev_gray is not None and ekf.is_ready():
@@ -783,8 +805,10 @@ with dai.Device(pipeline) as device:
                                     try:
                                         visual_queue.put_nowait((good_old, good_new, prev_depth))
                                         fallback_pts_prev = good_new.reshape(-1, 1, 2)
+                                        telemetry_stats["cpu_fallback_engagements"] += 1
                                         print("  [WARN] VPU Tracker dropped! CPU Optical Flow engaged.")
                                     except queue.Full:
+                                        telemetry_stats["visual_queue_drops"] += 1
                                         pass
                                 else:
                                     new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
@@ -839,8 +863,13 @@ with dai.Device(pipeline) as device:
         with open(res_file, "w") as f:
             json.dump(ekf.residual_log, f, indent=2)
             
+        telem_file = os.path.join(SAVE_DIR, "session_telemetry.json")
+        with open(telem_file, "w") as f:
+            json.dump(telemetry_stats, f, indent=2)
+            
         print(f"\n[DONE] {count} keyframes saved → {POSES_FILE}")
         print(f"  VIO telemetry saved → {res_file}")
+        print(f"  Session telemetry saved → {telem_file}")
         print(f"  Total EKF ticks monitored: {ekf_frame_counter}")
         if ekf_frame_counter > 0:
             print(f"  Retention rate: {(count/ekf_frame_counter)*100:.1f}%")
