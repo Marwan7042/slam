@@ -1,6 +1,6 @@
 {
     "paths": {
-        "scan_dir": "./coral_scan"
+        "scan_dir": "./coral_scan2"
     },
     "hardware": {
         "calibration_mode": "custom",
@@ -36,22 +36,22 @@
     "ekf_tuning": {
         "static_variance_threshold": 0.01,
         "static_variance_window": 100,
-        "min_gravity_samples": 200,
-        "min_feature_update": 8,
-        "depth_patch_radius": 3,
-        "depth_min_mm": 150,
-        "depth_max_mm": 3000
+        "min_gravity_samples": 150,
+        "min_feature_update": 12,
+        "depth_patch_radius": 2,
+        "depth_min_mm": 300.0,
+        "depth_max_mm": 5000.0
     },
     "reconstruction": {
-        "min_cloud_points": 100,
+        "depth_quantile_pruning": 0.95,
         "voxel_tracking_m": 0.02,
-        "voxel_loop_m": 0.05,
-        "voxel_tsdf_m": 0.008,
-        "depth_quantile_pruning": 0.99,
-        "loop_closure_interval": 5,
-        "min_loop_frame_distance": 20,
-        "loop_top_k": 5,
-        "allow_multi_loops": true,
-        "z_regularize": true
+        "voxel_loop_m": 0.04,
+        "voxel_tsdf_m": 0.005,
+        "loop_closure_interval": 10,
+        "min_loop_frame_distance": 50,
+        "allow_multi_loops": false,
+        "loop_top_k": 3,
+        "z_regularize": true,
+        "min_cloud_points": 200
     }
 }

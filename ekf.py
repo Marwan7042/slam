@@ -67,10 +67,6 @@ def _build_F_and_Qd_jit(F,Qd,R,a_b,w_b,dt,na_var,ng_var,nba_var,nbg_var):
         F[i,i]=1.0
     F[0,3]=dt;F[1,4]=dt;F[2,5]=dt;ax,ay,az=a_b[0],a_b[1],a_b[2]
     
-    # --- GRANDMASTER FIX: VELOCITY JACOBIAN SIGN ERROR ---
-    # In a local error state, d_vdot / d_phi = - R * [a_b]x
-    # c0, c1, c2 correctly compute the columns of (- R * [a_b]x).
-    # Previous code multiplied these by -dt, flipping the Jacobian to (+ R * [a_b]x), causing divergence.
     for i in range(3):
         c0 = -R[i,1]*az + R[i,2]*ay
         c1 =  R[i,0]*az - R[i,2]*ax
@@ -78,7 +74,6 @@ def _build_F_and_Qd_jit(F,Qd,R,a_b,w_b,dt,na_var,ng_var,nba_var,nbg_var):
         F[3+i, 6] = c0*dt
         F[3+i, 7] = c1*dt
         F[3+i, 8] = c2*dt
-    # -----------------------------------------------------
 
     wx,wy,wz=w_b[0],w_b[1],w_b[2]
     F[6,6]=1.0;F[6,7]=wz*dt;F[6,8]=-wy*dt;F[7,6]=-wz*dt;F[7,7]=1.0;F[7,8]=wx*dt;F[8,6]=wy*dt;F[8,7]=-wx*dt;F[8,8]=1.0
@@ -157,13 +152,27 @@ class VIO_EKF:
         self._kf_p=np.zeros(3); self._kf_R=np.eye(3); self._kf_set=False
         self._step_count=0
         
+        self._starvation_ticks = 0 # COVARIANCE INFLATION TRACKER
+        
         self._last_v_p = None
         self._last_v_R = None
         self.residual_log = [] 
 
     def feed_imu(self, a, g, ts):
         with self._lock: 
-            self._propagate(a, g, ts)
+            # --- IMU SHOCK ABSORBER ---
+            a_clipped = np.clip(a, -25.0, 25.0)
+            g_clipped = np.clip(g, -5.0, 5.0)
+            
+            self._propagate(a_clipped, g_clipped, ts)
+            
+            # --- NaN QUARANTINE ---
+            if np.isnan(self.p).any() or np.isnan(self.R).any():
+                print("  [CRITICAL] NaN detected in IMU Propagation! Reverting state.")
+                if self._last_v_p is not None:
+                    self.p[:] = self._last_v_p
+                    self.R[:] = self._last_v_R
+                    self.v[:] = np.zeros(3)
 
     def _propagate(self, accel_raw, gyro_raw, ts):
         norm=math.sqrt(accel_raw[0]**2+accel_raw[1]**2+accel_raw[2]**2)
@@ -227,9 +236,11 @@ class VIO_EKF:
         with self._lock: 
             return self._w_b.copy()
 
-    # --- RESTORED: T_ic and T_ci explicitly passed in from record.py ---
     def update_visual(self, pts_p, pts_c, depth_p, K, T_ic, T_ci):
         if len(pts_p) < MIN_FEAT_UPDATE: 
+            with self._lock:
+                self._starvation_ticks += 1
+                if self._starvation_ticks > 10: self.P *= 1.01
             return False, 0
         
         fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
@@ -240,11 +251,24 @@ class VIO_EKF:
         
         valid = dmm > 0
         if valid.sum() < MIN_FEAT_UPDATE: 
+            with self._lock:
+                self._starvation_ticks += 1
+                if self._starvation_ticks > 10: self.P *= 1.01
             return False, 0
         
         p_val = pts_p[valid]
         c_val = pts_c[valid]
         d_val = dmm[valid] / 1000.0
+
+        # --- GEOMETRIC DEGENERACY GATE ---
+        if len(p_val) > 0:
+            var_x = np.var(p_val[:, 0])
+            var_y = np.var(p_val[:, 1])
+            if var_x < 1000.0 or var_y < 1000.0:
+                with self._lock:
+                    self._starvation_ticks += 1
+                    if self._starvation_ticks > 10: self.P *= 1.01
+                return False, 0
         
         X = (p_val[:, 0] - cx) * d_val / fx
         Y = (p_val[:, 1] - cy) * d_val / fy
@@ -257,6 +281,9 @@ class VIO_EKF:
         
         n_inliers = len(inliers) if inliers is not None else 0
         if not success or n_inliers < MIN_FEAT_UPDATE: 
+            with self._lock:
+                self._starvation_ticks += 1
+                if self._starvation_ticks > 10: self.P *= 1.01
             return False, n_inliers
             
         ni = n_inliers
@@ -265,18 +292,16 @@ class VIO_EKF:
         R_p_c = R_c_p.T
         t_p_c = (-R_p_c @ tvec).flatten()
 
-        # --- GRANDMASTER FIX: EXTRINSIC FRAME ALIGNMENT ---
-        # Transform the relative Camera motion into relative IMU motion
+        # --- EXTRINSIC FRAME ALIGNMENT ---
         T_c_curr_c_prev = np.eye(4)
         T_c_curr_c_prev[:3, :3] = R_p_c
         T_c_curr_c_prev[:3, 3] = t_p_c
 
-        # T_{I_curr}^{I_prev} = T_{I}^{C} * T_{C_curr}^{C_prev} * T_{C}^{I}
         T_i_curr_i_prev = T_ic @ T_c_curr_c_prev @ T_ci
         R_p_c_imu = T_i_curr_i_prev[:3, :3]
         t_p_c_imu = T_i_curr_i_prev[:3, 3]
         
-        # --- RESTORED: DYNAMIC NOISE SCALING ---
+        # --- DYNAMIC NOISE SCALING ---
         inlier_idx = inliers.flatten()
         mean_depth = float(np.mean(d_val[inlier_idx]))
         depth_scale = max(1.0, mean_depth**2)
@@ -292,8 +317,7 @@ class VIO_EKF:
             
             R_meas_world = self._last_v_R @ R_p_c_imu
             
-            # --- GRANDMASTER FIX: PURE LOCAL ERROR STATE FORMULATION ---
-            # To match the F matrix, error state must be R_err = R_pred.T @ R_meas
+            # --- PURE LOCAL ERROR STATE FORMULATION ---
             R_err = self.R.T @ R_meas_world
             dphi_body = _mat_to_rotvec_jit(R_err)
             
@@ -307,19 +331,24 @@ class VIO_EKF:
             H[:3, :3] = self._I3
             H[3:6, 6:9] = self._I3
             
-            # Apply dynamic scaling to the visual noise matrix
             R_vis_dyn = self._R_vis.copy()
             R_vis_dyn[0, 0] *= depth_scale
             R_vis_dyn[1, 1] *= depth_scale
             R_vis_dyn[2, 2] *= depth_scale
             
             S = H @ self.P @ H.T + R_vis_dyn
-            try: Si = np.linalg.inv(S)
-            except Exception: return False, ni
+            try: 
+                Si = np.linalg.inv(S)
+            except Exception: 
+                self._starvation_ticks += 1
+                return False, ni
             
-            # --- RESTORED: MAHALANOBIS GATE ---
+            # --- MAHALANOBIS GATE ---
             mahalanobis_sq = innov.T @ Si @ innov
             if mahalanobis_sq > 12.59:
+                self._starvation_ticks += 1
+                if self._starvation_ticks > 10:
+                    self.P *= 1.02 # Aggressive inflation during active rejection
                 return False, ni 
             
             K_gain = self.P @ H.T @ Si
@@ -328,8 +357,6 @@ class VIO_EKF:
             self.p += dx[:3]; self.v += dx[3:6]
             _rodrigues_jit(dx[6], dx[7], dx[8], self._tmp33)
             
-            # --- GRANDMASTER FIX: RIGHT-MULTIPLY LOCAL UPDATE ---
-            # R_new = R_old * Delta_R  (Matches local error formulation)
             _mat3_mul(self.R, self._tmp33, self._dR)
             self.R[:] = self._dR
             
@@ -339,6 +366,16 @@ class VIO_EKF:
             self.P[:] = IKH @ self.P @ IKH.T + K_gain @ R_vis_dyn @ K_gain.T
             _symmetrise_15(self.P)
             
+            self._starvation_ticks = 0 # Update successful, reset starvation
+            
+            # --- NaN QUARANTINE (VISUAL) ---
+            if np.isnan(self.p).any() or np.isnan(self.R).any() or np.isnan(self.P).any():
+                print("  [CRITICAL] NaN detected in Visual Update! Reverting state.")
+                self.p[:] = self._last_v_p
+                self.R[:] = self._last_v_R
+                self.P[:] = np.eye(15) * 1e-3 # Reset covariance safely
+                return False, ni
+
             self._last_v_p = self.p.copy()
             self._last_v_R = self.R.copy()
             

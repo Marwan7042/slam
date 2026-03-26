@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import os, json, time, threading, queue
 import http.server, socketserver
+from urllib.parse import urlparse, parse_qs
 from datetime import timedelta
 import sys, select, termios, tty
 import math
@@ -34,7 +35,7 @@ IR_DOT_BRIGHTNESS  = CFG["hardware"]["ir_dot_brightness_ma"]
 LOCK_EXPOSURE      = CFG["hardware"]["lock_exposure"]
 EXPOSURE_TIME_US   = CFG["hardware"]["exposure_time_us"]
 ISO_SENSITIVITY    = CFG["hardware"]["iso_sensitivity"]
-CALIBRATION_MODE   = CFG.get("hardware", {}).get("calibration_mode", "factory").lower()
+CALIBRATION_MODE   = CFG.get("hardware", {}).get("calibration_mode", "custom").lower()
 
 GATE_MIN_FRAME_GAP   = CFG["keyframe_gating"]["min_frame_gap"]
 GATE_MAX_FRAME_GAP   = CFG["keyframe_gating"]["max_frame_gap"]
@@ -93,7 +94,7 @@ hud_telemetry = {
     "blur": 0.0,
     "depth_pct": 0.0,
     "message": "AWAITING GRAVITY CALIBRATION",
-    "cpu_fallback": False # <--- Tracks if CPU LK Optical Flow is engaged
+    "cpu_fallback": False 
 }
 hud_lock = threading.Lock()
 runtime_state = {"bad_streak_counter": 0} 
@@ -101,7 +102,7 @@ runtime_state = {"bad_streak_counter": 0}
 # ============================================================
 # THREADS
 # ============================================================
-def visual_worker(ekf, K_mat):
+def visual_worker(ekf, K_mat, T_ic, T_ci):
     ok = 0
     fail = 0
     while not stop_event.is_set():
@@ -113,7 +114,8 @@ def visual_worker(ekf, K_mat):
         if item is None: 
             break
             
-        r, n = ekf.update_visual(item[0], item[1], item[2], K_mat)
+        # Passing extrinsics into the visual update to correctly map Camera -> IMU frames
+        r, n = ekf.update_visual(item[0], item[1], item[2], K_mat, T_ic, T_ci)
         if r: 
             ok += 1
         else: 
@@ -152,34 +154,36 @@ def imu_worker(device, ekf):
             time.sleep(0.01)
 
 # ============================================================
-# WEB SERVER (DUAL STREAM + GUI SLIDER)
+# WEB SERVER (DUAL STREAM + GUI SLIDER + HARDENED PARSING)
 # ============================================================
 class MJPEGHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        parsed_path = urlparse(self.path)
+        
         # --- API Endpoints for Camera Control ---
-        if self.path.startswith('/set_wb'):
+        if parsed_path.path == '/set_wb':
             try:
-                val = int(self.path.split('=')[1])
-                with cam_ctrl_lock: cam_state["wb"] = val
+                val = int(parse_qs(parsed_path.query)['v'][0])
+                with cam_ctrl_lock: cam_state["wb"] = max(2500, min(8000, val))
             except Exception: pass
             self.send_response(200); self.end_headers(); return
 
-        if self.path.startswith('/set_exp'):
+        if parsed_path.path == '/set_exp':
             try:
-                val = int(self.path.split('=')[1])
-                with cam_ctrl_lock: cam_state["exp"] = val
+                val = int(parse_qs(parsed_path.query)['v'][0])
+                with cam_ctrl_lock: cam_state["exp"] = max(1000, min(33000, val))
             except Exception: pass
             self.send_response(200); self.end_headers(); return
 
-        if self.path.startswith('/set_iso'):
+        if parsed_path.path == '/set_iso':
             try:
-                val = int(self.path.split('=')[1])
-                with cam_ctrl_lock: cam_state["iso"] = val
+                val = int(parse_qs(parsed_path.query)['v'][0])
+                with cam_ctrl_lock: cam_state["iso"] = max(100, min(1600, val))
             except Exception: pass
             self.send_response(200); self.end_headers(); return
 
         # --- Video Streams ---
-        if self.path == '/stream':
+        if parsed_path.path == '/stream':
             self.send_response(200)
             self.send_header('Cache-Control', 'no-cache,private')
             self.send_header('Content-Type', 'multipart/x-mixed-replace;boundary=FRAME')
@@ -197,7 +201,7 @@ class MJPEGHandler(http.server.BaseHTTPRequestHandler):
             except Exception: 
                 pass
                 
-        elif self.path == '/hud':
+        elif parsed_path.path == '/hud':
             self.send_response(200)
             self.send_header('Cache-Control', 'no-cache,private')
             self.send_header('Content-Type', 'multipart/x-mixed-replace;boundary=FRAME')
@@ -223,7 +227,6 @@ class MJPEGHandler(http.server.BaseHTTPRequestHandler):
                         cv2.putText(frame, f"BLUR: {telem['blur']:.1f}px", (15, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                         cv2.putText(frame, f"DEPTH: {telem['depth_pct']*100:.1f}%", (15, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                         
-                        # CPU Fallback Warning
                         if telem.get("cpu_fallback"):
                             cv2.putText(frame, "CPU OPTICAL FLOW ACTIVE", (15, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
                         
@@ -348,7 +351,6 @@ if LOCK_EXPOSURE:
     cam.initialControl.setManualWhiteBalance(cam_state["wb"])
     print(f"[HW] Locked Camera Exposure: {cam_state['exp']/1000:.1f}ms / ISO {cam_state['iso']} / WB {cam_state['wb']}K")
 
-# Control node to update Camera Settings dynamically
 controlIn = pipeline.create(dai.node.XLinkIn)
 controlIn.setStreamName('control')
 controlIn.out.link(cam.inputControl)
@@ -414,7 +416,6 @@ xout_i.input.setBlocking(False)
 xout_i.input.setQueueSize(10)
 imu_n.out.link(xout_i.input)
 
-# --- THE GRANDMASTER FIX: PERFECT HARDWARE SYNCHRONIZATION ---
 sync = pipeline.create(dai.node.Sync)
 sync.setSyncThreshold(timedelta(milliseconds=30))
 sync.inputs["rgb"].setBlocking(False)
@@ -458,7 +459,7 @@ with dai.Device(pipeline) as device:
         try:
             calib = device.readCalibration()
             cal_source = "CUSTOM (EEPROM)"
-            print("[CAL] ✓ Using custom device EEPROM calibration (as requested or fallback)")
+            print("[CAL] ✓ Using current device calibration (custom EEPROM / fallback)")
         except Exception as e:
             print(f"[CAL] ⚠ Could not read any calibration: {e}")
 
@@ -483,10 +484,11 @@ with dai.Device(pipeline) as device:
             T_ci = np.vstack([T_ci, [0,0,0,1]])
         T_ic = np.linalg.inv(T_ci)
     except Exception as e:
+        T_ci = np.eye(4)
         T_ic = np.eye(4)
 
     imu_t = threading.Thread(target=imu_worker, args=(device,ekf), daemon=True)
-    vis_t = threading.Thread(target=visual_worker, args=(ekf,K_mat), daemon=True)
+    vis_t = threading.Thread(target=visual_worker, args=(ekf,K_mat, T_ic, T_ci), daemon=True)
     imu_t.start()
     vis_t.start()
 
@@ -507,7 +509,6 @@ with dai.Device(pipeline) as device:
     current_applied_exp = 0
     current_applied_iso = 0
 
-    # CPU Fallback Trackers
     gray_curr = None
     prev_gray = None
     fallback_pts_prev = None
@@ -527,6 +528,7 @@ with dai.Device(pipeline) as device:
         print(f"[WARN] Terminal setup failed: {e}. Key inputs ignored.")
 
     last_calib_print = 0
+    last_heartbeat = time.time()
 
     try:
         while True:
@@ -573,7 +575,6 @@ with dai.Device(pipeline) as device:
             mp = qp.tryGet()
             if mp:
                 frame_np = mp.getCvFrame()
-                # Apply configurable color restoration to HUD
                 if CR_ENABLED and CR_HUD:
                     preview_to_show = fast_underwater_restore(frame_np, CR_R_MAX, CR_G_MAX)
                 else:
@@ -583,16 +584,26 @@ with dai.Device(pipeline) as device:
                     latest_preview = preview_to_show
 
             sy = qs.tryGet()
+            
+            # --- QUEUE WATCHDOG: SILENT DEATH FIX ---
+            if sy or mj or mp:
+                last_heartbeat = time.time()
+                
+            if time.time() - last_heartbeat > 5.0:
+                print("\n[FATAL] HARDWARE QUEUE STALL DETECTED! No frames for 5 seconds.")
+                with hud_lock:
+                    hud_telemetry["state"] = "BAD"
+                    hud_telemetry["message"] = "FATAL: HARDWARE SENSOR STALL"
+                break  # Emergency abort the loop so it doesn't spin silently
+            # -----------------------------------------
+            
             if sy:
                 raw_rgb = sy["rgb"].getCvFrame()
                 dep = sy["depth"].getFrame().astype(np.uint16)
                 fm = sy["features"]
                 
-                # --- CPU FALLBACK PREP ---
                 gray_curr = cv2.cvtColor(raw_rgb, cv2.COLOR_BGR2GRAY)
-                # -------------------------
                 
-                # Apply configurable color restoration to Recording
                 if CR_ENABLED and CR_REC:
                     rgb_to_save = fast_underwater_restore(raw_rgb, CR_R_MAX, CR_G_MAX)
                 else:
@@ -722,7 +733,6 @@ with dai.Device(pipeline) as device:
                         })
                         
                         try:
-                            # Save the correctly restored (or raw) image
                             disk_queue.put_nowait((os.path.join(RGB_DIR, f"{count:04d}.jpg"), rgb_to_save))
                             disk_queue.put_nowait((os.path.join(DEPTH_DIR, f"{count:04d}.png"), dep))
                         except queue.Full:
@@ -736,7 +746,6 @@ with dai.Device(pipeline) as device:
                             print(f"  [{count:04d} | idx:{ekf_frame_counter}] "
                                   f"Health: {quality_score:.2f} ({quality_state}) | {reason}")
 
-                # --- HARDWARE + CPU FALLBACK TRACKING ---
                 if fm and gray_curr is not None:
                     cf = {t.id:(float(t.position.x),float(t.position.y)) for t in fm.trackedFeatures}
                     ds_curr = depth_dbuf.read() if depth_dbuf else None
@@ -744,7 +753,6 @@ with dai.Device(pipeline) as device:
                     hw_features_sent = False
                     cpu_fallback_active = False
 
-                    # 1. TRY HARDWARE TRACKER FIRST
                     if prev_fd and prev_depth is not None and ekf.is_ready():
                         pp, pc = [], []
                         for fid, c in cf.items():
@@ -754,56 +762,43 @@ with dai.Device(pipeline) as device:
                                 
                         if len(pp) >= MIN_FEAT_UPDATE:
                             try: 
-                                # GRANDMASTER FIX: Explicitly cast hardware points to float32 
-                                # to prevent cv2.calcOpticalFlowPyrLK from crashing on float64 arrays
                                 pp_arr = np.array(pp, dtype=np.float32)
                                 pc_arr = np.array(pc, dtype=np.float32)
                                 visual_queue.put_nowait((pp_arr, pc_arr, prev_depth))
                                 hw_features_sent = True
-                                
-                                # Keep our fallback points updated with the healthy hardware points
                                 fallback_pts_prev = pc_arr.reshape(-1, 1, 2)
                             except queue.Full: 
                                 pass
                     
-                    # 2. TRIGGER CPU FALLBACK IF HARDWARE FAILS
                     if not hw_features_sent and prev_gray is not None and ekf.is_ready():
                         cpu_fallback_active = True
-                        # Check if we have points to track from the previous frame
                         if fallback_pts_prev is not None and len(fallback_pts_prev) > 0:
-                            # Calculate optical flow
                             p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_curr, fallback_pts_prev, None, **lk_params)
                             
-                            # Select good points
                             if p1 is not None and st is not None:
                                 good_new = p1[st == 1]
                                 good_old = fallback_pts_prev[st == 1]
                                 
                                 if len(good_new) >= MIN_FEAT_UPDATE:
                                     try:
-                                        # Send the CPU-tracked features to the EKF
                                         visual_queue.put_nowait((good_old, good_new, prev_depth))
                                         fallback_pts_prev = good_new.reshape(-1, 1, 2)
                                         print("  [WARN] VPU Tracker dropped! CPU Optical Flow engaged.")
                                     except queue.Full:
                                         pass
                                 else:
-                                    # Total tracking loss. Re-detect features from scratch for the next frame.
                                     new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
                                     fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
                             else:
                                 new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
                                 fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
                         else:
-                            # We didn't have valid points to start with, re-seed.
                             new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
                             fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
                     
-                    # Update HUD with CPU Fallback status
                     with hud_lock:
                         hud_telemetry["cpu_fallback"] = cpu_fallback_active
                     
-                    # Update states for the next loop iteration
                     prev_fd = cf
                     prev_gray = gray_curr.copy()
                     
@@ -820,7 +815,6 @@ with dai.Device(pipeline) as device:
         stop_event.set()
         recording_event.clear()
         
-        # GRANDMASTER FIX: Flush queues before inserting poison pill to avoid infinite deadlocks
         while not visual_queue.empty():
             try: visual_queue.get_nowait()
             except: break
