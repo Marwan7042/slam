@@ -1,0 +1,56 @@
+{
+    "paths": {
+        "scan_dir": "./coral_scan2"
+    },
+    "hardware": {
+        "target_fps": 10,
+        "imu_rate_hz": 200,
+        "use_ir_projector": true,
+        "ir_dot_brightness_ma": 800,
+        "lock_exposure": true,
+        "exposure_time_us": 15000,
+        "iso_sensitivity": 800,
+        "decimate_factor": 1,
+        "enable_intel_igpu": true
+    },
+    "keyframe_gating": {
+        "min_frame_gap": 2,
+        "max_frame_gap": 15,
+        "min_depth_valid_ratio": 0.25,
+        "max_blur_pixels": 5.0
+    },
+    "color_restore": {
+        "enabled": true,
+        "r_max_gain": 3.0,
+        "g_max_gain": 1.2,
+        "apply_to_hud": true,
+        "apply_to_recording": true
+    },
+    "quality_control": {
+        "ideal_depth_ratio": 0.40,
+        "severe_blur_px": 10.0,
+        "score_good_threshold": 0.75,
+        "score_weak_threshold": 0.40
+    },
+    "ekf_tuning": {
+        "static_variance_threshold": 0.01,
+        "static_variance_window": 100,
+        "min_gravity_samples": 200,
+        "min_feature_update": 8,
+        "depth_patch_radius": 3,
+        "depth_min_mm": 150,
+        "depth_max_mm": 3000
+    },
+    "reconstruction": {
+        "min_cloud_points": 100,
+        "voxel_tracking_m": 0.02,
+        "voxel_loop_m": 0.05,
+        "voxel_tsdf_m": 0.008,
+        "depth_quantile_pruning": 0.99,
+        "loop_closure_interval": 5,
+        "min_loop_frame_distance": 20,
+        "loop_top_k": 5,
+        "allow_multi_loops": true,
+        "z_regularize": true
+    }
+}
