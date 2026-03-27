@@ -1,5 +1,5 @@
 
-##Visual SLAM Pipeline for Underwater Mapping
+## Visual SLAM Pipeline for Underwater Mapping
 
 **Visual-Inertial Odometry and Dense Reconstruction Pipeline for Subsea Environments**
 
