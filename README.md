@@ -38,7 +38,7 @@ The pipeline fuses high-frequency inertial data with stereo vision utilizing a 1
 ### Setup
 ```bash
 git clone [https://github.com/Marwan7042/slam.git](https://github.com/Marwan7042/slam.git)
-cd triton-slam
+cd slam
 
 pip install numpy opencv-contrib-python depthai open3d numba psutil
 ```
