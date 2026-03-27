@@ -40,7 +40,8 @@
         "min_feature_update": 12,
         "depth_patch_radius": 2,
         "depth_min_mm": 300.0,
-        "depth_max_mm": 5000.0
+        "depth_max_mm": 5000.0,
+        "imu_vibration_multiplier": 15.0
     },
     "reconstruction": {
         "depth_quantile_pruning": 0.95,

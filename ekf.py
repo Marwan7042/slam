@@ -5,6 +5,7 @@ from utils import njit, RunningVariance
 from load_config import CFG
 
 # Import EKF constants securely from CFG
+# Import EKF constants securely from CFG
 STATIC_VAR_THR   = CFG["ekf_tuning"]["static_variance_threshold"]
 STATIC_WIN       = CFG["ekf_tuning"]["static_variance_window"]
 MIN_GRAV_SAMPLES = CFG["ekf_tuning"]["min_gravity_samples"]
@@ -13,10 +14,22 @@ DEPTH_PATCH_R    = CFG["ekf_tuning"]["depth_patch_radius"]
 DEPTH_MIN_MM     = CFG["ekf_tuning"]["depth_min_mm"]
 DEPTH_MAX_MM     = CFG["ekf_tuning"]["depth_max_mm"]
 
-ACCEL_ND  = 160e-6 * 9.81
-GYRO_ND   = np.deg2rad(0.007)
+# --- IMU NOISE PARAMETERS ---
+# Baseline noise densities (e.g., standard MEMS IMU on the OAK-D)
+_BASE_ACCEL_ND  = 160e-6 * 9.81
+_BASE_GYRO_ND   = np.deg2rad(0.007)
+
+# Bias Random Walk (Internal silicon drift, largely unaffected by vibration)
 ACCEL_BRW = 40e-6 * 9.81
 GYRO_BRW  = np.deg2rad(0.5 / 3600.0)
+
+# Apply the structural vibration multiplier from config
+VIB_MULTIPLIER = CFG["ekf_tuning"].get("imu_vibration_multiplier", 15.0)
+
+ACCEL_ND = _BASE_ACCEL_ND * VIB_MULTIPLIER
+GYRO_ND  = _BASE_GYRO_ND * VIB_MULTIPLIER
+
+# Visual Noise Baselines
 VIS_NOISE_P   = (0.010)**2
 VIS_NOISE_PHI = (np.deg2rad(1.0))**2
 REORTHO_INTERVAL = 500
