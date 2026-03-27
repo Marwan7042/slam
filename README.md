@@ -3,10 +3,10 @@
 
 **Visual-Inertial Odometry and Dense Reconstruction Pipeline for Subsea Environments**
 
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)]()
-[![Open3D](https://img.shields.io/badge/Open3D-0.16%2B-lightgrey.svg)]()
-[![DepthAI](https://img.shields.io/badge/DepthAI-OAK--D-orange.svg)]()
-[![Numba](https://img.shields.io/badge/Numba-JIT-green.svg)]()
+[![Python]([https://img.shields.io/badge/Python-3.8%2B-blue.svg](https://www.python.org/))]()
+[![Open3D]([https://img.shields.io/badge/Open3D-0.16%2B-lightgrey.svg](https://www.open3d.org/))]()
+[![DepthAI]([https://img.shields.io/badge/DepthAI-OAK--D-orange.svg](https://docs.luxonis.com/software-v3/depthai/))]()
+[![Numba]([https://img.shields.io/badge/Numba-JIT-green.svg](https://numba.pydata.org/))]()
 
 ---
 
