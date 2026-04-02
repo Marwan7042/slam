@@ -278,6 +278,13 @@ class VIO_EKF:
             return self._w_b.copy()
 
     def update_visual(self, pts_p, pts_c, depth_p, K, T_ic, T_ci, camera_timestamp):
+        # --- DEFENSIVE RESHAPE TO FIX OPENCV (N, 1, 2) FORMAT ---
+        if pts_p.ndim == 3:
+            pts_p = pts_p.reshape(-1, 2)
+        if pts_c.ndim == 3:
+            pts_c = pts_c.reshape(-1, 2)
+        # --------------------------------------------------------
+
         if len(pts_p) < MIN_FEAT_UPDATE: 
             with self._lock:
                 self._starvation_ticks += 1
