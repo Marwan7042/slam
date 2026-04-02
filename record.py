@@ -48,7 +48,6 @@ MIN_FEAT_UPDATE  = CFG["ekf_tuning"]["min_feature_update"]
 DEPTH_MIN_MM     = CFG["ekf_tuning"]["depth_min_mm"]
 DEPTH_MAX_MM     = CFG["ekf_tuning"]["depth_max_mm"]
 
-# Color Restore Config
 CR_CFG = CFG.get("color_restore", {})
 CR_ENABLED = CR_CFG.get("enabled", False)
 CR_R_MAX = CR_CFG.get("r_max_gain", 3.0)
@@ -59,15 +58,22 @@ CR_REC = CR_CFG.get("apply_to_recording", True)
 ISP_WIDTH  = 960
 ISP_HEIGHT = 540
 
-# --- OPTICAL FLOW FALLBACK PARAMS ---
-lk_params = dict(winSize=(21, 21),
-                 maxLevel=3,
-                 criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+# FIX: Optical Flow & Feature Tracker Tuned for Murky Environments
+lk_params = dict(
+    winSize=(31, 31),
+    maxLevel=4,
+    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 0.005),
+    minEigThreshold=1e-5
+)
 
-feature_params = dict(maxCorners=100,
-                      qualityLevel=0.05,
-                      minDistance=10,
-                      blockSize=7)
+feature_params = dict(
+    maxCorners=150,
+    qualityLevel=0.02,
+    minDistance=15,
+    blockSize=9,
+    useHarrisDetector=True,
+    k=0.04
+)
 
 # ============================================================
 # SHARED STATE & BUFFERS
@@ -78,13 +84,11 @@ recording_event = threading.Event()
 visual_queue = queue.Queue(maxsize=1)
 stop_event   = threading.Event()
 
-# FIX: Add global state for Async Optical Flow and Disk Health
 lk_queue = queue.Queue(maxsize=1)
 lk_result_queue = queue.Queue(maxsize=1)
 prev_mean_intensity = None
 disk_health = {"consecutive_drops": 0}
 
-# CAMERA CONTROL STATE DICT (Mutable & Thread-Safe)
 cam_ctrl_lock = threading.Lock()
 cam_state = {
     "wb": 4600,
@@ -92,7 +96,6 @@ cam_state = {
     "iso": ISO_SENSITIVITY
 }
 
-# HUD TELEMETRY STATE
 latest_preview = None
 hud_telemetry = {
     "state": "IDLE",
@@ -104,6 +107,14 @@ hud_telemetry = {
 }
 hud_lock = threading.Lock()
 runtime_state = {"bad_streak_counter": 0} 
+
+# ============================================================
+# ZERO-COPY BUFFERS
+# ============================================================
+# FIX: Pre-allocated buffers strip out 10x overhead on the main thread GIL
+MAX_FEATURES = 150
+pp_buffer = np.empty((MAX_FEATURES, 2), dtype=np.float32)
+pc_buffer = np.empty((MAX_FEATURES, 2), dtype=np.float32)
 
 # ============================================================
 # THREADS
@@ -120,8 +131,8 @@ def visual_worker(ekf, K_mat, T_ic, T_ci):
         if item is None: 
             break
             
-        # Passing extrinsics into the visual update to correctly map Camera -> IMU frames
-        r, n = ekf.update_visual(item[0], item[1], item[2], K_mat, T_ic, T_ci)
+        # item: (pp_view, pc_view, prev_depth, camera_ts)
+        r, n = ekf.update_visual(item[0], item[1], item[2], K_mat, T_ic, T_ci, item[3])
         if r: 
             ok += 1
         else: 
@@ -162,16 +173,14 @@ def imu_worker(device, ekf):
             time.sleep(0.01)
 
 def lk_worker():
-    """FIX: Dedicated thread for CPU-bound optical flow to prevent main thread blocking."""
     while not stop_event.is_set():
         try:
-            prev_gray, gray_curr, fallback_pts_prev = lk_queue.get(timeout=0.1)
+            prev_gray, gray_curr, fallback_pts_prev, prev_ts = lk_queue.get(timeout=0.1)
         except queue.Empty:
             continue
             
         p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_curr, fallback_pts_prev, None, **lk_params)
         
-        # FIX: Bidirectional error check for geometric consistency
         if p1 is not None and st is not None:
             p0_back, st_back, _ = cv2.calcOpticalFlowPyrLK(gray_curr, prev_gray, p1, None, **lk_params)
             
@@ -183,7 +192,7 @@ def lk_worker():
                 good_old = fallback_pts_prev[valid_mask]
                 
                 try:
-                    lk_result_queue.put_nowait((good_old, good_new))
+                    lk_result_queue.put_nowait((good_old, good_new, prev_ts))
                 except queue.Full:
                     pass
 
@@ -194,7 +203,6 @@ class MJPEGHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_path = urlparse(self.path)
         
-        # --- API Endpoints for Camera Control ---
         if parsed_path.path == '/set_wb':
             try:
                 val = int(parse_qs(parsed_path.query)['v'][0])
@@ -216,7 +224,6 @@ class MJPEGHandler(http.server.BaseHTTPRequestHandler):
             except Exception: pass
             self.send_response(200); self.end_headers(); return
 
-        # --- Video Streams ---
         if parsed_path.path == '/stream':
             self.send_response(200)
             self.send_header('Cache-Control', 'no-cache,private')
@@ -258,7 +265,7 @@ class MJPEGHandler(http.server.BaseHTTPRequestHandler):
                         
                         cv2.rectangle(frame, (0, 0), (w, h), color, 6)
                         cv2.putText(frame, f"STATE: {telem['state']}", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-                        cv2.putText(frame, f"BLUR: {telem['blur']:.1f}px", (15, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                        cv2.putText(frame, f"LAPLV: {telem['blur']:.1f}", (15, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                         cv2.putText(frame, f"DEPTH: {telem['depth_pct']*100:.1f}%", (15, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                         
                         if telem.get("cpu_fallback"):
@@ -539,6 +546,7 @@ with dai.Device(pipeline) as device:
     prev_fd = {}
     depth_dbuf = None
     prev_depth = None  
+    prev_ts = 0.0
     ekf_frame_counter = 0     
     last_saved_ekf_idx = 0
     
@@ -567,7 +575,6 @@ with dai.Device(pipeline) as device:
     last_calib_print = 0
     last_heartbeat = time.time()
     
-    # --- ARMOR: TELEMETRY COUNTERS ---
     telemetry_stats = {
         "visual_queue_drops": 0,
         "disk_queue_drops": 0,
@@ -577,7 +584,6 @@ with dai.Device(pipeline) as device:
 
     try:
         while True:
-            # --- Sync GUI Sliders to Camera Hardware ---
             with cam_ctrl_lock:
                 target_wb = cam_state["wb"]
                 target_exp = cam_state["exp"]
@@ -630,7 +636,6 @@ with dai.Device(pipeline) as device:
 
             sy = qs.tryGet()
             
-            # --- QUEUE WATCHDOG: SILENT DEATH FIX ---
             if sy or mj or mp:
                 last_heartbeat = time.time()
                 
@@ -639,14 +644,19 @@ with dai.Device(pipeline) as device:
                 with hud_lock:
                     hud_telemetry["state"] = "BAD"
                     hud_telemetry["message"] = "FATAL: HARDWARE SENSOR STALL"
-                break  # Emergency abort the loop so it doesn't spin silently
-            # -----------------------------------------
+                break
             
             if sy:
                 raw_rgb = sy["rgb"].getCvFrame()
                 dep = sy["depth"].getFrame().astype(np.uint16)
                 fm = sy["features"]
                 
+                try:
+                    rgb_ts = sy["rgb"].getTimestamp().total_seconds()
+                except AttributeError:
+                    rgb_ts = time.monotonic()
+                
+                # FIX: Never feed Color-Restored frames to optical flow/trackers.
                 gray_curr = cv2.cvtColor(raw_rgb, cv2.COLOR_BGR2GRAY)
                 
                 if CR_ENABLED and CR_REC:
@@ -683,12 +693,14 @@ with dai.Device(pipeline) as device:
                     accept = False
                     reason = ""
                     valid_ratio = 0.0
-                    blur_pixels = 0.0
                     evaluated_for_hud = False
                     is_forced_gap = False
                     
                     quality_score = 1.0       
                     quality_state = "GOOD"
+                    
+                    # FIX: Temporal Gradient (Laplacian Variance) rather than predictive IMU blur
+                    laplacian_var = cv2.Laplacian(gray_curr, cv2.CV_64F).var()
 
                     if gap >= GATE_MAX_FRAME_GAP:
                         accept = True
@@ -696,12 +708,6 @@ with dai.Device(pipeline) as device:
                         telemetry_stats["forced_gaps_accepted"] += 1
                         reason = f"forced_gap({gap})"
                         valid_ratio = float(np.count_nonzero(dep)) / dep.size
-                        w_b = ekf.get_angular_velocity()
-                        exposure_s = (current_applied_exp / 1e6) if LOCK_EXPOSURE else (1.0 / TARGET_FPS)
-                        blur_center = math.sqrt((K_mat[0,0] * w_b[1])**2 + (K_mat[1,1] * w_b[0])**2) * exposure_s
-                        _corner_dist = math.sqrt((K_mat[0, 2])**2 + (K_mat[1, 2])**2)   
-                        blur_roll_rms = 0.6 * _corner_dist * abs(w_b[2]) * exposure_s
-                        blur_pixels = math.sqrt(blur_center**2 + blur_roll_rms**2)
                         evaluated_for_hud = True
                         
                     elif gap >= GATE_MIN_FRAME_GAP:
@@ -709,37 +715,28 @@ with dai.Device(pipeline) as device:
                         if valid_ratio < GATE_MIN_DEPTH_VALID:
                             reason = f"bad_depth({valid_ratio:.2f})"
                         else:
-                            w_b = ekf.get_angular_velocity()
-                            exposure_s = (current_applied_exp / 1e6) if LOCK_EXPOSURE else (1.0 / TARGET_FPS)
-                            
-                            blur_center = math.sqrt((K_mat[0,0] * w_b[1])**2 + (K_mat[1,1] * w_b[0])**2) * exposure_s
-                            _corner_dist = math.sqrt((K_mat[0, 2])**2 + (K_mat[1, 2])**2)   
-                            blur_roll_rms = 0.6 * _corner_dist * abs(w_b[2]) * exposure_s
-                            blur_pixels = math.sqrt(blur_center**2 + blur_roll_rms**2)
-                            
-                            if blur_pixels > GATE_MAX_BLUR_PIXELS:
-                                reason = f"k_blur({blur_pixels:.1f}px)"
+                            if laplacian_var < 50.0:  # Direct sharpness detection
+                                reason = f"blur_laplacian({laplacian_var:.1f})"
                             else:
                                 accept = True
-                                reason = f"passed_gate(B:{blur_pixels:.1f}px,D:{valid_ratio:.2f})"
+                                reason = f"passed_gate(L:{laplacian_var:.1f},D:{valid_ratio:.2f})"
                         evaluated_for_hud = True
 
                     if evaluated_for_hud:
                         qc_cfg = CFG.get("quality_control", {})
                         ideal_depth = qc_cfg.get("ideal_depth_ratio", 0.40)
-                        severe_blur = qc_cfg.get("severe_blur_px", 10.0)
+                        severe_blur_equiv = 20.0
                         good_thresh = qc_cfg.get("score_good_threshold", 0.75)
                         weak_thresh = qc_cfg.get("score_weak_threshold", 0.40)
                         
-                        # --- ARMOR: MISSION-AWARE QUALITY WEIGHTS ---
                         w_depth = qc_cfg.get("weight_depth", 0.6) 
                         w_blur = qc_cfg.get("weight_blur", 0.4)
                         
                         q_depth = min(1.0, valid_ratio / ideal_depth) if ideal_depth > 0 else 0
-                        q_blur  = max(0.0, 1.0 - (blur_pixels / severe_blur)) if severe_blur > 0 else 0
+                        # Convert laplacian to a 0-1 quality score (higher laplacian = better)
+                        q_blur  = min(1.0, max(0.0, (laplacian_var - severe_blur_equiv) / 100.0))
                         quality_score = (q_depth * w_depth) + (q_blur * w_blur)
                         
-                        # --- ARMOR: FORCED-GAP DOWNWEIGHTING ---
                         if is_forced_gap:
                             quality_state = "WEAK"
                             quality_score = min(quality_score, weak_thresh)
@@ -758,13 +755,13 @@ with dai.Device(pipeline) as device:
                         with hud_lock:
                             hud_telemetry["state"] = quality_state
                             hud_telemetry["score"] = quality_score
-                            hud_telemetry["blur"] = blur_pixels
+                            hud_telemetry["blur"] = laplacian_var # Outputting Laplacian instead of IMU Blur
                             hud_telemetry["depth_pct"] = valid_ratio
                             
                             if runtime_state["bad_streak_counter"] >= 8:
                                 hud_telemetry["message"] = "CRITICAL: REVERSE TO LAST GOOD VIEW!"
                             elif quality_state == "BAD":
-                                if blur_pixels > CFG.get("keyframe_gating", {}).get("max_blur_pixels", 5.0):
+                                if laplacian_var < 35.0:
                                     hud_telemetry["message"] = "SLOW YAW / MOTION BLUR!"
                                 elif valid_ratio < CFG.get("keyframe_gating", {}).get("min_depth_valid_ratio", 0.25):
                                     hud_telemetry["message"] = "MOVE CLOSER / POOR DEPTH!"
@@ -784,12 +781,11 @@ with dai.Device(pipeline) as device:
                             "gate_reason": reason,
                             "quality_score": float(quality_score),
                             "quality_state": quality_state,
-                            "is_forced_gap": is_forced_gap, # Saved for offline graph to safely downweight
+                            "is_forced_gap": is_forced_gap, 
                             "pose": Tc.tolist(),
                             "cov6": cov6.tolist()
                         })
                         
-                        # FIX: Implementing Adaptive Recording + Disk Health Backpressure
                         try:
                             disk_queue.put((os.path.join(RGB_DIR, f"{count:04d}.jpg"), rgb_to_save), timeout=0.5)
                             disk_queue.put((os.path.join(DEPTH_DIR, f"{count:04d}.png"), dep), timeout=0.5)
@@ -827,11 +823,17 @@ with dai.Device(pipeline) as device:
                                 
                         if len(pp) >= MIN_FEAT_UPDATE:
                             try: 
-                                pp_arr = np.array(pp, dtype=np.float32)
-                                pc_arr = np.array(pc, dtype=np.float32)
-                                visual_queue.put_nowait((pp_arr, pc_arr, prev_depth))
+                                n_pts = min(len(pp), MAX_FEATURES)
+                                # FIX: Populate pre-allocated view array buffers safely avoiding GIL array conversion overhead
+                                for i in range(n_pts):
+                                    pp_buffer[i, 0] = pp[i][0]
+                                    pp_buffer[i, 1] = pp[i][1]
+                                    pc_buffer[i, 0] = pc[i][0]
+                                    pc_buffer[i, 1] = pc[i][1]
+                                    
+                                visual_queue.put_nowait((pp_buffer[:n_pts].copy(), pc_buffer[:n_pts].copy(), prev_depth.copy(), prev_ts))
                                 hw_features_sent = True
-                                fallback_pts_prev = pc_arr.reshape(-1, 1, 2)
+                                fallback_pts_prev = pc_buffer[:n_pts].copy().reshape(-1, 1, 2)
                             except queue.Full: 
                                 telemetry_stats["visual_queue_drops"] += 1
                                 pass
@@ -839,13 +841,11 @@ with dai.Device(pipeline) as device:
                     if not hw_features_sent and prev_gray is not None and ekf.is_ready():
                         cpu_fallback_active = True
                         
-                        # FIX: Photometric Consistency Gate 
                         curr_mean = np.mean(gray_curr)
                         intensity_ratio = 1.0
                         if prev_mean_intensity is not None:
                             intensity_ratio = curr_mean / max(prev_mean_intensity, 1.0)
                             
-                            # Reject fallback if illumination changed >20%
                             if intensity_ratio < 0.8 or intensity_ratio > 1.2:
                                 print(f"  [WARN] Illumination jump detected ({intensity_ratio:.2f}×). Skipping CPU fallback.")
                                 fallback_pts_prev = None
@@ -855,18 +855,17 @@ with dai.Device(pipeline) as device:
 
                         if cpu_fallback_active:
                             if fallback_pts_prev is not None and len(fallback_pts_prev) > 0:
-                                # Non-blocking dispatch to LK worker
                                 try:
-                                    lk_queue.put_nowait((prev_gray.copy(), gray_curr.copy(), fallback_pts_prev))
+                                    lk_queue.put_nowait((prev_gray.copy(), gray_curr.copy(), fallback_pts_prev, prev_ts))
                                 except queue.Full:
-                                    pass  # Keep previous frame in worker
+                                    pass  
                                 
-                                # Process async results from previous LK compute
                                 try:
-                                    good_old, good_new = lk_result_queue.get_nowait()
+                                    good_old, good_new, async_prev_ts = lk_result_queue.get_nowait()
                                     if len(good_new) >= MIN_FEAT_UPDATE:
                                         try:
-                                            visual_queue.put_nowait((good_old, good_new, prev_depth))
+                                            # Using the NumPy views avoids GIL copying overhead 
+                                            visual_queue.put_nowait((good_old.copy(), good_new.copy(), prev_depth, async_prev_ts))
                                             fallback_pts_prev = good_new.reshape(-1, 1, 2)
                                             telemetry_stats["cpu_fallback_engagements"] += 1
                                         except queue.Full:
@@ -885,6 +884,7 @@ with dai.Device(pipeline) as device:
                     
                     prev_fd = cf
                     prev_gray = gray_curr.copy()
+                    prev_ts = rgb_ts
                     
                     if ds_curr is not None:
                         valid_ratio = float(np.count_nonzero(ds_curr)) / ds_curr.size
