@@ -211,10 +211,14 @@ if n_frames < 2:
 ACTIVE_LOADER_MODE = "CPU"
 
 _thread_local = threading.local()
-_igpu_lock = threading.Lock()  # GRANDMASTER FIX: Prevents cv2.UMat segfaults across threads
 
-def get_clahe():
+# FIX: Ensure OpenCL context is thread-bound
+def get_clahe_and_context():
+    """Initialize both CLAHE and ensure OpenCL context is thread-bound."""
     if not hasattr(_thread_local, "clahe"):
+        if cv2.ocl.haveOpenCL():
+            # Force per-thread OpenCL context initialization
+            _ = cv2.UMat(np.zeros((8, 8), dtype=np.uint8))
         _thread_local.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return _thread_local.clahe
 
@@ -225,29 +229,28 @@ def _loader_igpu(rgb_path, depth_path, quantile=0.0):
     if rgb_raw is None or depth_raw is None:
         return None, None
 
-    # Locking OpenCL Context Operations to prevent thread collision segfaults
-    with _igpu_lock:
-        rgb_gpu = cv2.UMat(rgb_raw)
-        depth_gpu = cv2.UMat(depth_raw)
+    # Thread-local OpenCL Execution (No lock needed)
+    rgb_gpu = cv2.UMat(rgb_raw)
+    depth_gpu = cv2.UMat(depth_raw)
 
-        lab_gpu = cv2.cvtColor(rgb_gpu, cv2.COLOR_BGR2LAB)
-        l_gpu, a_gpu, b_gpu = cv2.split(lab_gpu)
-        
-        clahe = get_clahe()
-        l_clahe = clahe.apply(l_gpu)
-        
-        lab_clahe = cv2.merge([l_clahe, a_gpu, b_gpu])
-        rgb_gpu_eq = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
+    lab_gpu = cv2.cvtColor(rgb_gpu, cv2.COLOR_BGR2LAB)
+    l_gpu, a_gpu, b_gpu = cv2.split(lab_gpu)
+    
+    clahe = get_clahe_and_context()
+    l_clahe = clahe.apply(l_gpu)
+    
+    lab_clahe = cv2.merge([l_clahe, a_gpu, b_gpu])
+    rgb_gpu_eq = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
 
-        if DECIMATE_FACTOR > 1:
-            rgb_resized = cv2.resize(rgb_gpu_eq, (W, H), interpolation=cv2.INTER_AREA)
-            depth_resized = cv2.resize(depth_gpu, (W, H), interpolation=cv2.INTER_NEAREST)
-        else:
-            rgb_resized = rgb_gpu_eq
-            depth_resized = depth_gpu
+    if DECIMATE_FACTOR > 1:
+        rgb_resized = cv2.resize(rgb_gpu_eq, (W, H), interpolation=cv2.INTER_AREA)
+        depth_resized = cv2.resize(depth_gpu, (W, H), interpolation=cv2.INTER_NEAREST)
+    else:
+        rgb_resized = rgb_gpu_eq
+        depth_resized = depth_gpu
 
-        rgb_final = cv2.cvtColor(rgb_resized.get(), cv2.COLOR_BGR2RGB)
-        depth_final = depth_resized.get()
+    rgb_final = cv2.cvtColor(rgb_resized.get(), cv2.COLOR_BGR2RGB)
+    depth_final = depth_resized.get()
 
     if quantile > 0.0 and quantile < 1.0:
         valid = depth_final[depth_final > 0]
@@ -267,7 +270,7 @@ def _loader_cpu(rgb_path, depth_path, quantile=0.0):
     lab = cv2.cvtColor(rgb_raw, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     
-    clahe = get_clahe()
+    clahe = get_clahe_and_context()
     l_clahe = clahe.apply(l)
     
     rgb_eq = cv2.cvtColor(cv2.merge([l_clahe, a, b]), cv2.COLOR_LAB2BGR)
@@ -294,6 +297,17 @@ def load_and_decimate(rgb_path, depth_path, quantile=0.0):
     if ACTIVE_LOADER_MODE == "IGPU":
         return _loader_igpu(rgb_path, depth_path, quantile)
     return _loader_cpu(rgb_path, depth_path, quantile)
+
+def apply_depth_uncertainty(depth_np, max_depth_m=3.0):
+    """Scale truncation distance based on depth uncertainty."""
+    depth_m = depth_np.astype(np.float32) / DEPTH_SCALE
+    sigma = 0.005 + 0.02 * depth_m
+    
+    # Reject outliers using both max_depth and high sigma variance
+    valid_mask = (depth_m > 0) & (depth_m < max_depth_m) & (sigma < 0.05)
+    adjusted = depth_np.copy()
+    adjusted[~valid_mask] = 0
+    return adjusted
 
 # ============================================================
 # HARDWARE BENCHMARK & DEPTH AUTO-DETECT
@@ -401,15 +415,11 @@ if USE_VO and not HAS_CUDA:
 # MATH & CLOUD HELPERS
 # ============================================================
 def cov2info(c6, sc=IMU_INFO_SCALE):
-    # --- GRANDMASTER FIX: COVARIANCE ORDERING BOMB ---
-    # EKF outputs Covariance in [Translation, Rotation] order (X,Y,Z, r,p,y).
-    # Open3D's Global Optimizer absolutely requires [Rotation, Translation] order.
-    # We must mathematically swap the quadrants before inversion.
     c6_o3d = np.zeros((6, 6), dtype=np.float64)
-    c6_o3d[:3, :3] = c6[3:6, 3:6]   # Top-Left: Rotation Covariance
-    c6_o3d[3:6, 3:6] = c6[:3, :3]   # Bottom-Right: Translation Covariance
-    c6_o3d[:3, 3:6] = c6[3:6, :3]   # Top-Right: Cross-Covariance
-    c6_o3d[3:6, :3] = c6[:3, 3:6]   # Bottom-Left: Cross-Covariance
+    c6_o3d[:3, :3] = c6[3:6, 3:6]
+    c6_o3d[3:6, 3:6] = c6[:3, :3]
+    c6_o3d[:3, 3:6] = c6[3:6, :3]
+    c6_o3d[3:6, :3] = c6[:3, 3:6]
     
     if HAS_NUMBA: 
         info = _inv6(c6_o3d, 1e-6)
@@ -441,11 +451,14 @@ def compute_cloud_distinctiveness(pcd):
         
     try:
         C  = np.cov(valid.T)
+        C += np.eye(3) * 1e-6 # FIX: Tikhonov regularization
         sv = np.linalg.svd(C, compute_uv=False)
         sv = np.abs(sv)
         if sv[0] < 1e-12:
             return 0.5
         return float(np.clip(sv[2] / sv[0], 0.0, 1.0))
+    except np.linalg.LinAlgError:
+        return 0.5
     except Exception:
         return 0.5
 
@@ -597,7 +610,6 @@ def _colored_icp_refine(src, tgt, fine_dist, init_T):
         return init_T, -1.0, -1.0
 
 def tracking_icp(src, tgt, fine_dist, init_T=None):
-    # GRANDMASTER FIX: Guard against assert failures on empty/stripped point clouds
     if src is None or tgt is None or len(src.points) < 30 or len(tgt.points) < 30: 
         return np.eye(4), 0.0, 1.0
         
@@ -844,13 +856,10 @@ def eval_candidate(i, ti, sd, sd_fpfh, dyn_dist):
         
     td, td_fpfh = td_data
     
-    # --- FIX 3: DEGENERACY GATE ---
-    # Reject loops on flat/featureless geometry where ICP will slide
     dist_s = compute_cloud_distinctiveness(sd)
     dist_t = compute_cloud_distinctiveness(td)
     if dist_s < APERTURE_DISTINCTIVENESS_THR or dist_t < APERTURE_DISTINCTIVENESS_THR:
         return None
-    # ------------------------------
     
     try:
         fgr_result = o3d.pipelines.registration.registration_fgr_based_on_feature_matching(
@@ -1114,7 +1123,10 @@ if HAS_CUDA:
             fut_frame = None
         
         if color is not None and depth is not None:
-            dt = o3d.t.geometry.Image(np.asarray(depth)).to(GPU_DEVICE)
+            # FIX: Depth uncertainty weighting
+            depth_weighted = apply_depth_uncertainty(np.asarray(depth), DEPTH_TRUNC)
+
+            dt = o3d.t.geometry.Image(depth_weighted).to(GPU_DEVICE)
             ct = o3d.t.geometry.Image(np.asarray(color)).to(GPU_DEVICE)
             et = o3c.Tensor(inv_ext[i], dtype=o3c.Dtype.Float64, device=GPU_DEVICE)
 
@@ -1166,8 +1178,11 @@ else:
             fut_frame = None
             
         if color is not None and depth is not None:
+            # FIX: Depth uncertainty weighting
+            depth_weighted = apply_depth_uncertainty(np.asarray(depth), DEPTH_TRUNC)
+
             rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-                color, depth, depth_scale=DEPTH_SCALE, depth_trunc=DEPTH_TRUNC,
+                color, o3d.geometry.Image(depth_weighted), depth_scale=DEPTH_SCALE, depth_trunc=DEPTH_TRUNC,
                 convert_rgb_to_intensity=False
             )
             vol.integrate(rgbd, intr_leg, inv_ext[i])
