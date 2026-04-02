@@ -256,6 +256,10 @@ class MJPEGHandler(http.server.BaseHTTPRequestHandler):
                     frame = frame_ref.copy() if frame_ref is not None else None
                     
                     if frame is not None:
+                        # FIX: Apply color restore here in the background thread, not the main thread!
+                        if CR_ENABLED and CR_HUD:
+                            frame = fast_underwater_restore(frame, CR_R_MAX, CR_G_MAX)
+                            
                         h, w = frame.shape[:2]
                         
                         if telem["state"] == "GOOD":   color = (0, 255, 0)      
@@ -626,13 +630,10 @@ with dai.Device(pipeline) as device:
             mp = qp.tryGet()
             if mp:
                 frame_np = mp.getCvFrame()
-                if CR_ENABLED and CR_HUD:
-                    preview_to_show = fast_underwater_restore(frame_np, CR_R_MAX, CR_G_MAX)
-                else:
-                    preview_to_show = frame_np
-                    
+                # FIX: Do not apply fast_underwater_restore here!
+                # Simply store the raw frame reference and let the background HTTP thread process it
                 with hud_lock:
-                    latest_preview = preview_to_show
+                    latest_preview = frame_np
 
             sy = qs.tryGet()
             
@@ -864,9 +865,12 @@ with dai.Device(pipeline) as device:
                                     good_old, good_new, async_prev_ts = lk_result_queue.get_nowait()
                                     if len(good_new) >= MIN_FEAT_UPDATE:
                                         try:
-                                            # Using the NumPy views avoids GIL copying overhead 
-                                            visual_queue.put_nowait((good_old.copy(), good_new.copy(), prev_depth, async_prev_ts))
-                                            fallback_pts_prev = good_new.reshape(-1, 1, 2)
+                                            # FIX: Flatten views to avoid EKF array slicing crash
+                                            good_old_flat = good_old.reshape(-1, 2).copy()
+                                            good_new_flat = good_new.reshape(-1, 2).copy()
+                                            
+                                            visual_queue.put_nowait((good_old_flat, good_new_flat, prev_depth, async_prev_ts))
+                                            fallback_pts_prev = good_new.reshape(-1, 1, 2) # Keep (N,1,2) for next LK iteration
                                             telemetry_stats["cpu_fallback_engagements"] += 1
                                         except queue.Full:
                                             telemetry_stats["visual_queue_drops"] += 1
