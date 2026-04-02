@@ -12,7 +12,7 @@
 
 ## Overview
 
-Triton is a Simultaneous Localization and Mapping (SLAM) system designed for underwater ROV navigation, addressing domain-specific challenges such as optical refraction, variable turbidity, and dynamic lighting. 
+This is a Simultaneous Localization and Mapping (SLAM) system designed for underwater ROV navigation, addressing domain-specific challenges such as optical refraction, variable turbidity, and dynamic lighting. 
 
 The pipeline fuses high-frequency inertial data with stereo vision utilizing a 15-Degree-of-Freedom (DOF) Local Error-State Kalman Filter (ESKF) for real-time state estimation. Offline, the estimated trajectory seeds a global pose graph, followed by Truncated Signed Distance Function (TSDF) volumetric integration to generate a dense 3D mesh.
 
@@ -21,7 +21,7 @@ The pipeline fuses high-frequency inertial data with stereo vision utilizing a 1
 ## Architecture and Key Features
 
 * **Hardware-Level Sensor Synchronization:** Utilizes Luxonis DepthAI spatial nodes to align RGB, depth, and VPU feature timestamps, mitigating Out-Of-Sequence Measurement (OOSM) errors.
-* **15-DOF ESKF Formulation:** Estimates position, velocity, orientation ($SO(3)$), and IMU biases. Implements a local error-state Lie algebra formulation to prevent covariance singularities.
+* **15-DOF ESKF Formulation:** Estimates position, velocity, orientation SO(3), and IMU biases. Implements a local error-state Lie algebra formulation to prevent covariance singularities.
 * **Dynamic Motion-Blur Gating:** Calculates estimated pixel blur as a function of focal length and real-time angular velocity. Frames exceeding the defined threshold are rejected prior to visual processing.
 * **CPU Optical Flow Fallback:** In the event of VPU tracking failure (e.g., rapid illumination changes), the system initiates CPU-bound Lucas-Kanade optical flow to maintain feature tracking and state continuity.
 * **Asynchronous Concurrency:** Implements isolated threads for hardware acquisition, visual processing, and disk I/O, utilizing zero-copy double-buffering and Numba JIT compilation to manage execution latency.
