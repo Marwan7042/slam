@@ -1,8 +1,18 @@
 import math
 import numpy as np
 import threading
-from utils import njit, RunningVariance
+from utils import RunningVariance
 from load_config import CFG
+
+try:
+    from numba import njit
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+    def njit(*args, **kwargs):
+        if len(args) == 1 and callable(args[0]): return args[0]
+        def decorator(func): return func
+        return decorator
 
 # Import EKF constants securely from CFG
 STATIC_VAR_THR   = CFG["ekf_tuning"]["static_variance_threshold"]
@@ -14,32 +24,30 @@ DEPTH_MIN_MM     = CFG["ekf_tuning"]["depth_min_mm"]
 DEPTH_MAX_MM     = CFG["ekf_tuning"]["depth_max_mm"]
 
 # --- IMU NOISE PARAMETERS ---
-# Baseline noise densities (e.g., standard MEMS IMU on the OAK-D)
 _BASE_ACCEL_ND  = 160e-6 * 9.81
 _BASE_GYRO_ND   = np.deg2rad(0.007)
 
-# Bias Random Walk (Internal silicon drift, largely unaffected by vibration)
-ACCEL_BRW = 40e-6 * 9.81
-GYRO_BRW  = np.deg2rad(0.5 / 3600.0)
+# FIX: Undertuned Bias Random Walk (BRW)
+# Empirically tuned for underwater ROV (thermal gradients + vibration harmonics)
+ACCEL_BRW = 2.0e-3 * 9.81         # 2.0 mg 
+GYRO_BRW  = np.deg2rad(1.5 / 3600.0) # 0.00042 rad/s
 
-# Apply the structural vibration multiplier from config
 VIB_MULTIPLIER = CFG["ekf_tuning"].get("imu_vibration_multiplier", 15.0)
 
 ACCEL_ND = _BASE_ACCEL_ND * VIB_MULTIPLIER
 GYRO_ND  = _BASE_GYRO_ND * VIB_MULTIPLIER
 
-# Visual Noise Baselines
 VIS_NOISE_P   = (0.010)**2
 VIS_NOISE_PHI = (np.deg2rad(1.0))**2
 REORTHO_INTERVAL = 500
 
-@njit(cache=True)
+# FIX: Enable fastmath=True to allow FMA and skip IEEE-754 checks for speed
+@njit(cache=True, fastmath=True)
 def _rodrigues_jit(wx,wy,wz,out):
     t2=wx*wx+wy*wy+wz*wz; t=math.sqrt(t2)
     if t<1e-9:
         out[0,0]=1.0;out[0,1]=-wz;out[0,2]=wy;out[1,0]=wz;out[1,1]=1.0;out[1,2]=-wx;out[2,0]=-wy;out[2,1]=wx;out[2,2]=1.0;return
     
-    # FIX: Gimbal lock / division by zero protection near π
     if t > 3.13: 
         t = 3.13
         scale = 3.13 / math.sqrt(t2)
@@ -48,7 +56,7 @@ def _rodrigues_jit(wx,wy,wz,out):
     c=math.cos(t);s=math.sin(t);tc=1.0-c;it=1.0/t;x=wx*it;y=wy*it;z=wz*it
     out[0,0]=tc*x*x+c;out[0,1]=tc*x*y-s*z;out[0,2]=tc*x*z+s*y;out[1,0]=tc*x*y+s*z;out[1,1]=tc*y*y+c;out[1,2]=tc*y*z-s*x;out[2,0]=tc*x*z-s*y;out[2,1]=tc*y*z+s*x;out[2,2]=tc*z*z+c
 
-@njit(cache=True)
+@njit(cache=True, fastmath=True)
 def _mat3_mul(A,B,out):
     for i in range(3):
         for j in range(3):
@@ -56,13 +64,13 @@ def _mat3_mul(A,B,out):
             for k in range(3): s+=A[i,k]*B[k,j]
             out[i,j]=s
 
-@njit(cache=True)
+@njit(cache=True, fastmath=True)
 def _mat3_vec(A,v,out):
     out[0]=A[0,0]*v[0]+A[0,1]*v[1]+A[0,2]*v[2];out[1]=A[1,0]*v[0]+A[1,1]*v[1]+A[1,2]*v[2];out[2]=A[2,0]*v[0]+A[2,1]*v[1]+A[2,2]*v[2]
 
-@njit(cache=True)
-def _triple_product_15(F,P,Qd,out):
-    tmp=np.empty((15,15))
+@njit(cache=True, fastmath=True)
+def _triple_product_15(F,P,Qd,out,tmp):
+    # FIX: Pre-allocated temp buffer avoids GIL allocation overhead
     for i in range(15):
         for j in range(15):
             s=0.0
@@ -74,18 +82,19 @@ def _triple_product_15(F,P,Qd,out):
             for k in range(15): s+=tmp[i,k]*F[j,k]
             out[i,j]=s+Qd[i,j]
 
-@njit(cache=True)
+@njit(cache=True, fastmath=True)
 def _symmetrise_15(P):
     for i in range(15):
         for j in range(i+1,15): avg=0.5*(P[i,j]+P[j,i]);P[i,j]=avg;P[j,i]=avg
 
-@njit(cache=True)
+@njit(cache=True, fastmath=True)
 def _build_F_and_Qd_jit(F,Qd,R,a_b,w_b,dt,na_var,ng_var,nba_var,nbg_var):
     for i in range(15):
         for j in range(15): F[i,j]=0.0;Qd[i,j]=0.0
         F[i,i]=1.0
     F[0,3]=dt;F[1,4]=dt;F[2,5]=dt;ax,ay,az=a_b[0],a_b[1],a_b[2]
     
+    # Jacobian -R[a_b]x
     for i in range(3):
         c0 = -R[i,1]*az + R[i,2]*ay
         c1 =  R[i,0]*az - R[i,2]*ax
@@ -99,8 +108,8 @@ def _build_F_and_Qd_jit(F,Qd,R,a_b,w_b,dt,na_var,ng_var,nba_var,nbg_var):
     F[6,12]=-dt;F[7,13]=-dt;F[8,14]=-dt
     Qd[3,3]=Qd[4,4]=Qd[5,5]=na_var*dt;Qd[6,6]=Qd[7,7]=Qd[8,8]=ng_var*dt;Qd[9,9]=Qd[10,10]=Qd[11,11]=nba_var*dt;Qd[12,12]=Qd[13,13]=Qd[14,14]=nbg_var*dt
 
-@njit(cache=True)
-def _propagate_state_jit(p,v,R,ba,bg,accel_raw,gyro_raw,dt,gravity_world,F,Qd,P,dR,dR_half,R_mid,a_w_mid,a_b,w_b,w_dt,na_var,ng_var,nba_var,nbg_var,step_count,reortho_interval):
+@njit(cache=True, fastmath=True)
+def _propagate_state_jit(p,v,R,ba,bg,accel_raw,gyro_raw,dt,gravity_world,F,Qd,P,dR,dR_half,R_mid,a_w_mid,a_b,w_b,w_dt,na_var,ng_var,nba_var,nbg_var,step_count,reortho_interval,tmp15):
     a_b[0]=accel_raw[0]-ba[0];a_b[1]=accel_raw[1]-ba[1];a_b[2]=accel_raw[2]-ba[2];w_b[0]=gyro_raw[0]-bg[0];w_b[1]=gyro_raw[1]-bg[1];w_b[2]=gyro_raw[2]-bg[2]
     w_dt[0]=w_b[0]*dt*0.5;w_dt[1]=w_b[1]*dt*0.5;w_dt[2]=w_b[2]*dt*0.5;_rodrigues_jit(w_dt[0],w_dt[1],w_dt[2],dR_half);_mat3_mul(R,dR_half,R_mid);_mat3_vec(R_mid,a_b,a_w_mid)
     a_w_mid[0]-=gravity_world[0];a_w_mid[1]-=gravity_world[1];a_w_mid[2]-=gravity_world[2];dt2h=0.5*dt*dt
@@ -116,10 +125,10 @@ def _propagate_state_jit(p,v,R,ba,bg,accel_raw,gyro_raw,dt,gravity_world,F,Qd,P,
         n1=math.sqrt(R[1,0]**2+R[1,1]**2+R[1,2]**2)
         if n1>1e-12: R[1,0]/=n1;R[1,1]/=n1;R[1,2]/=n1
         R[2,0]=R[0,1]*R[1,2]-R[0,2]*R[1,1];R[2,1]=R[0,2]*R[1,0]-R[0,0]*R[1,2];R[2,2]=R[0,0]*R[1,1]-R[0,1]*R[1,0]
-    _build_F_and_Qd_jit(F,Qd,R,a_b,w_b,dt,na_var,ng_var,nba_var,nbg_var);_triple_product_15(F,P,Qd,P);_symmetrise_15(P)
+    _build_F_and_Qd_jit(F,Qd,R,a_b,w_b,dt,na_var,ng_var,nba_var,nbg_var);_triple_product_15(F,P,Qd,P,tmp15);_symmetrise_15(P)
     return step_count
 
-@njit(cache=True)
+@njit(cache=True, fastmath=True)
 def _batch_depth_lookup_jit(depth_map,xs,ys,r,h,w,min_mm,max_mm):
     n=len(xs);result=np.zeros(n,dtype=np.float64)
     for idx in range(n):
@@ -140,7 +149,7 @@ def _batch_depth_lookup_jit(depth_map,xs,ys,r,h,w,min_mm,max_mm):
             result[idx]=vals[vc//2]
     return result
 
-@njit(cache=True)
+@njit(cache=True, fastmath=True)
 def _mat_to_rotvec_jit(R):
     val=(R[0,0]+R[1,1]+R[2,2]-1.0)*0.5
     if val>1.0: val=1.0
@@ -165,27 +174,28 @@ class VIO_EKF:
         self._a_w_mid=np.zeros(3); self._a_b=np.zeros(3)
         self._w_b=np.zeros(3); self._w_dt=np.zeros(3)
         self._tmp33=np.zeros((3,3)); self._P_tmp=np.zeros((15,15))
+        
+        # Pre-allocated 15x15 buffer for JIT
+        self._tmp15x15 = np.empty((15, 15), dtype=np.float64)
+        
         self.gravity_world=None; self.gravity_ready=False
         self._var_tracker=RunningVariance(STATIC_WIN)
         self._still_accels=[]; self.last_imu_ts=None
         self._kf_p=np.zeros(3); self._kf_R=np.eye(3); self._kf_set=False
         self._step_count=0
         
-        self._starvation_ticks = 0 # COVARIANCE INFLATION TRACKER
-        
+        self._starvation_ticks = 0 
         self._last_v_p = None
         self._last_v_R = None
         self.residual_log = [] 
 
     def feed_imu(self, a, g, ts):
         with self._lock: 
-            # --- IMU SHOCK ABSORBER ---
             a_clipped = np.clip(a, -25.0, 25.0)
             g_clipped = np.clip(g, -5.0, 5.0)
             
             self._propagate(a_clipped, g_clipped, ts)
             
-            # --- NaN QUARANTINE ---
             if np.isnan(self.p).any() or np.isnan(self.R).any():
                 print("  [CRITICAL] NaN detected in IMU Propagation! Reverting state.")
                 if self._last_v_p is not None:
@@ -202,12 +212,10 @@ class VIO_EKF:
             if is_s:
                 self._still_accels.append(accel_raw.copy())
                 if len(self._still_accels) >= MIN_GRAV_SAMPLES:
-                    # FIX: RANSAC style outlier rejection for gravity
                     samples = np.array(self._still_accels)
                     norms = np.linalg.norm(samples, axis=1)
                     median_norm = float(np.median(norms))
                     
-                    # Keep samples within +/- 5% of median
                     inlier_mask = np.abs(norms - median_norm) < 0.05 * median_norm
                     inliers = samples[inlier_mask]
                     
@@ -256,7 +264,7 @@ class VIO_EKF:
             self._dR, self._dR_half, self._R_mid, self._a_w_mid,
             self._a_b, self._w_b, self._w_dt,
             ACCEL_ND**2, GYRO_ND**2, ACCEL_BRW**2, GYRO_BRW**2,
-            self._step_count, REORTHO_INTERVAL
+            self._step_count, REORTHO_INTERVAL, self._tmp15x15
         )
 
     def set_keyframe(self):
@@ -269,12 +277,11 @@ class VIO_EKF:
         with self._lock: 
             return self._w_b.copy()
 
-    def update_visual(self, pts_p, pts_c, depth_p, K, T_ic, T_ci):
+    def update_visual(self, pts_p, pts_c, depth_p, K, T_ic, T_ci, camera_timestamp):
         if len(pts_p) < MIN_FEAT_UPDATE: 
             with self._lock:
                 self._starvation_ticks += 1
                 if self._starvation_ticks > 500:
-                    # FIX: Additive position uncertainty inflation during extended dropout
                     self.P[0:3, 0:3] += np.eye(3) * (0.01**2)
             return False, 0
         
@@ -296,7 +303,6 @@ class VIO_EKF:
         c_val = pts_c[valid]
         d_val = dmm[valid] / 1000.0
 
-        # --- GEOMETRIC DEGENERACY GATE ---
         if len(p_val) > 0:
             var_x = np.var(p_val[:, 0])
             var_y = np.var(p_val[:, 1])
@@ -330,7 +336,6 @@ class VIO_EKF:
         R_p_c = R_c_p.T
         t_p_c = (-R_p_c @ tvec).flatten()
 
-        # --- EXTRINSIC FRAME ALIGNMENT ---
         T_c_curr_c_prev = np.eye(4)
         T_c_curr_c_prev[:3, :3] = R_p_c
         T_c_curr_c_prev[:3, 3] = t_p_c
@@ -339,24 +344,34 @@ class VIO_EKF:
         R_p_c_imu = T_i_curr_i_prev[:3, :3]
         t_p_c_imu = T_i_curr_i_prev[:3, 3]
         
-        # --- DYNAMIC NOISE SCALING ---
         inlier_idx = inliers.flatten()
         mean_depth = float(np.mean(d_val[inlier_idx]))
         depth_scale = max(1.0, mean_depth**2)
         
         with self._lock:
+            # FIX: Extrapolate backward to camera capture time to eliminate 15ms dynamic drift
+            dt_offset = self.last_imu_ts - camera_timestamp
+            
+            p_at_cam = self.p
+            R_at_cam = self.R
+            if dt_offset > 0.0 and dt_offset < 0.1:
+                p_at_cam = self.p - self.v * dt_offset
+                delta_phi = -self._w_b * dt_offset
+                dR_back = np.eye(3)
+                _rodrigues_jit(delta_phi[0], delta_phi[1], delta_phi[2], dR_back)
+                R_at_cam = dR_back @ self.R
+            
             if self._last_v_p is None:
-                self._last_v_p = self.p.copy()
-                self._last_v_R = self.R.copy()
+                self._last_v_p = p_at_cam.copy()
+                self._last_v_R = R_at_cam.copy()
                 return True, ni
                 
+            # Compare to extrapolated historical state
             t_meas_world = self._last_v_p + (self._last_v_R @ t_p_c_imu)
-            dpi_world = t_meas_world - self.p
+            dpi_world = t_meas_world - p_at_cam
             
             R_meas_world = self._last_v_R @ R_p_c_imu
-            
-            # --- PURE LOCAL ERROR STATE FORMULATION ---
-            R_err = self.R.T @ R_meas_world
+            R_err = R_at_cam.T @ R_meas_world
             dphi_body = _mat_to_rotvec_jit(R_err)
             
             innov = np.concatenate([dpi_world, dphi_body])
@@ -376,7 +391,6 @@ class VIO_EKF:
             
             S = H @ self.P @ H.T + R_vis_dyn
             
-            # FIX: Tikhonov regularization for numerical stability
             lambda_reg = 1e-6
             S_reg = S + np.eye(6) * lambda_reg
             
@@ -387,9 +401,8 @@ class VIO_EKF:
                 self._starvation_ticks += 1
                 return False, ni
             
-            # --- MAHALANOBIS GATE ---
             mahalanobis_sq = innov.T @ Si @ innov
-            if mahalanobis_sq > 16.81: # FIX: Stricter gate (16.81 is 99% confidence for 6DOF)
+            if mahalanobis_sq > 16.81: 
                 self._starvation_ticks += 1
                 return False, ni 
             
@@ -408,18 +421,17 @@ class VIO_EKF:
             self.P[:] = IKH @ self.P @ IKH.T + K_gain @ R_vis_dyn @ K_gain.T
             _symmetrise_15(self.P)
             
-            self._starvation_ticks = 0 # Update successful, reset starvation
+            self._starvation_ticks = 0
             
-            # --- NaN QUARANTINE (VISUAL) ---
             if np.isnan(self.p).any() or np.isnan(self.R).any() or np.isnan(self.P).any():
                 print("  [CRITICAL] NaN detected in Visual Update! Reverting state.")
                 self.p[:] = self._last_v_p
                 self.R[:] = self._last_v_R
-                self.P[:] = np.eye(15) * 1e-3 # Reset covariance safely
+                self.P[:] = np.eye(15) * 1e-3
                 return False, ni
 
-            self._last_v_p = self.p.copy()
-            self._last_v_R = self.R.copy()
+            self._last_v_p = p_at_cam.copy()
+            self._last_v_R = R_at_cam.copy()
             
         return True, ni
 
