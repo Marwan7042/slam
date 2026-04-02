@@ -78,6 +78,12 @@ recording_event = threading.Event()
 visual_queue = queue.Queue(maxsize=1)
 stop_event   = threading.Event()
 
+# FIX: Add global state for Async Optical Flow and Disk Health
+lk_queue = queue.Queue(maxsize=1)
+lk_result_queue = queue.Queue(maxsize=1)
+prev_mean_intensity = None
+disk_health = {"consecutive_drops": 0}
+
 # CAMERA CONTROL STATE DICT (Mutable & Thread-Safe)
 cam_ctrl_lock = threading.Lock()
 cam_state = {
@@ -127,6 +133,8 @@ def imu_worker(device, ekf):
     ab = np.zeros(3, dtype=np.float64)
     gb = np.zeros(3, dtype=np.float64)
     
+    last_overflow_warning = 0
+    
     while not stop_event.is_set():
         try:
             m = q.tryGet() 
@@ -152,6 +160,32 @@ def imu_worker(device, ekf):
                 break
             print(f"  [IMU] {e}")
             time.sleep(0.01)
+
+def lk_worker():
+    """FIX: Dedicated thread for CPU-bound optical flow to prevent main thread blocking."""
+    while not stop_event.is_set():
+        try:
+            prev_gray, gray_curr, fallback_pts_prev = lk_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+            
+        p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_curr, fallback_pts_prev, None, **lk_params)
+        
+        # FIX: Bidirectional error check for geometric consistency
+        if p1 is not None and st is not None:
+            p0_back, st_back, _ = cv2.calcOpticalFlowPyrLK(gray_curr, prev_gray, p1, None, **lk_params)
+            
+            if p0_back is not None:
+                fb_error = np.linalg.norm(fallback_pts_prev - p0_back, axis=2).flatten()
+                valid_mask = (st.flatten() == 1) & (st_back.flatten() == 1) & (fb_error < 1.0)
+                
+                good_new = p1[valid_mask]
+                good_old = fallback_pts_prev[valid_mask]
+                
+                try:
+                    lk_result_queue.put_nowait((good_old, good_new))
+                except queue.Full:
+                    pass
 
 # ============================================================
 # WEB SERVER (DUAL STREAM + GUI SLIDER + HARDENED PARSING)
@@ -489,8 +523,11 @@ with dai.Device(pipeline) as device:
 
     imu_t = threading.Thread(target=imu_worker, args=(device,ekf), daemon=True)
     vis_t = threading.Thread(target=visual_worker, args=(ekf,K_mat, T_ic, T_ci), daemon=True)
+    lk_thread = threading.Thread(target=lk_worker, daemon=True)
+    
     imu_t.start()
     vis_t.start()
+    lk_thread.start()
 
     qs = device.getOutputQueue("synced", 4, False)
     qj = device.getOutputQueue("mjpeg", 2, False) 
@@ -752,12 +789,19 @@ with dai.Device(pipeline) as device:
                             "cov6": cov6.tolist()
                         })
                         
+                        # FIX: Implementing Adaptive Recording + Disk Health Backpressure
                         try:
-                            disk_queue.put_nowait((os.path.join(RGB_DIR, f"{count:04d}.jpg"), rgb_to_save))
-                            disk_queue.put_nowait((os.path.join(DEPTH_DIR, f"{count:04d}.png"), dep))
+                            disk_queue.put((os.path.join(RGB_DIR, f"{count:04d}.jpg"), rgb_to_save), timeout=0.5)
+                            disk_queue.put((os.path.join(DEPTH_DIR, f"{count:04d}.png"), dep), timeout=0.5)
+                            disk_health["consecutive_drops"] = 0
                         except queue.Full:
                             telemetry_stats["disk_queue_drops"] += 1
-                            print("[WARN] Disk queue full, dropping save frame!")
+                            disk_health["consecutive_drops"] += 1
+                            if disk_health["consecutive_drops"] >= 3:
+                                with hud_lock:
+                                    hud_telemetry["message"] = "CRITICAL: DISK SLOW! REDUCE SPEED!"
+                                    hud_telemetry["state"] = "BAD"
+                                print(f"  [CRITICAL] Disk queue saturated. Consider increasing GATE_MIN_FRAME_GAP.")
                             
                         count += 1
                         last_saved_ekf_idx = ekf_frame_counter
@@ -794,32 +838,48 @@ with dai.Device(pipeline) as device:
                     
                     if not hw_features_sent and prev_gray is not None and ekf.is_ready():
                         cpu_fallback_active = True
-                        if fallback_pts_prev is not None and len(fallback_pts_prev) > 0:
-                            p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_curr, fallback_pts_prev, None, **lk_params)
+                        
+                        # FIX: Photometric Consistency Gate 
+                        curr_mean = np.mean(gray_curr)
+                        intensity_ratio = 1.0
+                        if prev_mean_intensity is not None:
+                            intensity_ratio = curr_mean / max(prev_mean_intensity, 1.0)
                             
-                            if p1 is not None and st is not None:
-                                good_new = p1[st == 1]
-                                good_old = fallback_pts_prev[st == 1]
+                            # Reject fallback if illumination changed >20%
+                            if intensity_ratio < 0.8 or intensity_ratio > 1.2:
+                                print(f"  [WARN] Illumination jump detected ({intensity_ratio:.2f}×). Skipping CPU fallback.")
+                                fallback_pts_prev = None
+                                cpu_fallback_active = False
                                 
-                                if len(good_new) >= MIN_FEAT_UPDATE:
-                                    try:
-                                        visual_queue.put_nowait((good_old, good_new, prev_depth))
-                                        fallback_pts_prev = good_new.reshape(-1, 1, 2)
-                                        telemetry_stats["cpu_fallback_engagements"] += 1
-                                        print("  [WARN] VPU Tracker dropped! CPU Optical Flow engaged.")
-                                    except queue.Full:
-                                        telemetry_stats["visual_queue_drops"] += 1
-                                        pass
-                                else:
-                                    new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
-                                    fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
+                        prev_mean_intensity = curr_mean
+
+                        if cpu_fallback_active:
+                            if fallback_pts_prev is not None and len(fallback_pts_prev) > 0:
+                                # Non-blocking dispatch to LK worker
+                                try:
+                                    lk_queue.put_nowait((prev_gray.copy(), gray_curr.copy(), fallback_pts_prev))
+                                except queue.Full:
+                                    pass  # Keep previous frame in worker
+                                
+                                # Process async results from previous LK compute
+                                try:
+                                    good_old, good_new = lk_result_queue.get_nowait()
+                                    if len(good_new) >= MIN_FEAT_UPDATE:
+                                        try:
+                                            visual_queue.put_nowait((good_old, good_new, prev_depth))
+                                            fallback_pts_prev = good_new.reshape(-1, 1, 2)
+                                            telemetry_stats["cpu_fallback_engagements"] += 1
+                                        except queue.Full:
+                                            telemetry_stats["visual_queue_drops"] += 1
+                                    else:
+                                        new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
+                                        fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
+                                except queue.Empty:
+                                    pass
                             else:
                                 new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
                                 fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
-                        else:
-                            new_pts = cv2.goodFeaturesToTrack(gray_curr, mask=None, **feature_params)
-                            fallback_pts_prev = new_pts if new_pts is not None else np.empty((0, 1, 2), dtype=np.float32)
-                    
+                        
                     with hud_lock:
                         hud_telemetry["cpu_fallback"] = cpu_fallback_active
                     
@@ -851,6 +911,7 @@ with dai.Device(pipeline) as device:
 
         imu_t.join(timeout=2.0)
         vis_t.join(timeout=2.0)
+        lk_thread.join(timeout=2.0)
         disk_thread.join(timeout=30.0)
         
         if has_tty and old_settings:
