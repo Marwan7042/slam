@@ -129,8 +129,9 @@ class DepthDoubleBuffer:
         self._lock = threading.Lock()
         
     def write(self, frame):
-        wi = self._write_idx
+        # FIX: Ensure lock protects the idx read to avoid torn reads/writes
         with self._lock:
+            wi = self._write_idx
             np.copyto(self._bufs[wi], frame)
             self._read_idx = wi
             self._write_idx = 1 - wi
