@@ -5,7 +5,6 @@ from utils import njit, RunningVariance
 from load_config import CFG
 
 # Import EKF constants securely from CFG
-# Import EKF constants securely from CFG
 STATIC_VAR_THR   = CFG["ekf_tuning"]["static_variance_threshold"]
 STATIC_WIN       = CFG["ekf_tuning"]["static_variance_window"]
 MIN_GRAV_SAMPLES = CFG["ekf_tuning"]["min_gravity_samples"]
@@ -37,8 +36,15 @@ REORTHO_INTERVAL = 500
 @njit(cache=True)
 def _rodrigues_jit(wx,wy,wz,out):
     t2=wx*wx+wy*wy+wz*wz; t=math.sqrt(t2)
-    if t<1e-6:
+    if t<1e-9:
         out[0,0]=1.0;out[0,1]=-wz;out[0,2]=wy;out[1,0]=wz;out[1,1]=1.0;out[1,2]=-wx;out[2,0]=-wy;out[2,1]=wx;out[2,2]=1.0;return
+    
+    # FIX: Gimbal lock / division by zero protection near π
+    if t > 3.13: 
+        t = 3.13
+        scale = 3.13 / math.sqrt(t2)
+        wx *= scale; wy *= scale; wz *= scale
+        
     c=math.cos(t);s=math.sin(t);tc=1.0-c;it=1.0/t;x=wx*it;y=wy*it;z=wz*it
     out[0,0]=tc*x*x+c;out[0,1]=tc*x*y-s*z;out[0,2]=tc*x*z+s*y;out[1,0]=tc*x*y+s*z;out[1,1]=tc*y*y+c;out[1,2]=tc*y*z-s*x;out[2,0]=tc*x*z-s*y;out[2,1]=tc*y*z+s*x;out[2,2]=tc*z*z+c
 
@@ -196,24 +202,38 @@ class VIO_EKF:
             if is_s:
                 self._still_accels.append(accel_raw.copy())
                 if len(self._still_accels) >= MIN_GRAV_SAMPLES:
-                    gb = np.mean(self._still_accels, axis=0)
-                    gm = float(np.linalg.norm(gb))
-                    if 9.5 < gm < 10.1:
-                        gu = gb / gm
-                        zd = np.array([0., 0., -1.])
-                        v = np.cross(gu, zd)
-                        s = np.linalg.norm(v)
-                        c = np.dot(gu, zd)
-                        if s < 1e-8: 
-                            Ra = np.eye(3) if c > 0 else np.diag([1., -1., -1.])
+                    # FIX: RANSAC style outlier rejection for gravity
+                    samples = np.array(self._still_accels)
+                    norms = np.linalg.norm(samples, axis=1)
+                    median_norm = float(np.median(norms))
+                    
+                    # Keep samples within +/- 5% of median
+                    inlier_mask = np.abs(norms - median_norm) < 0.05 * median_norm
+                    inliers = samples[inlier_mask]
+                    
+                    if len(inliers) >= MIN_GRAV_SAMPLES // 2:
+                        gb = np.mean(inliers, axis=0)
+                        gm = float(np.linalg.norm(gb))
+                        if 9.5 <= gm <= 10.5:
+                            gu = gb / gm
+                            zd = np.array([0., 0., -1.])
+                            v = np.cross(gu, zd)
+                            s = np.linalg.norm(v)
+                            c = np.dot(gu, zd)
+                            if s < 1e-8: 
+                                Ra = np.eye(3) if c > 0 else np.diag([1., -1., -1.])
+                            else:
+                                vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+                                Ra = np.eye(3) + vx + vx@vx * ((1. - c) / (s * s))
+                            self.R[:] = Ra
+                            self.gravity_world = np.array([0., 0., -gm])
+                            self.gravity_ready = True
+                            print(f"\n  [EKF] Gravity: ‖g‖={gm:.4f} m/s^2 ({len(inliers)}/{len(samples)} inliers)")
                         else:
-                            vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
-                            Ra = np.eye(3) + vx + vx@vx * ((1. - c) / (s * s))
-                        self.R[:] = Ra
-                        self.gravity_world = np.array([0., 0., -gm])
-                        self.gravity_ready = True
-                        print(f"\n  [EKF] Gravity: ‖g‖={gm:.4f}")
-                    else: 
+                            print(f"  [WARN] Gravity magnitude {gm:.2f} m/s^2 unrealistic. Recalibrating...")
+                            self._still_accels = []
+                    else:
+                        print(f"  [WARN] Too many gravity outliers. Recollecting...")
                         self._still_accels = []
             else:
                 self._still_accels = []
@@ -253,7 +273,9 @@ class VIO_EKF:
         if len(pts_p) < MIN_FEAT_UPDATE: 
             with self._lock:
                 self._starvation_ticks += 1
-                if self._starvation_ticks > 10: self.P *= 1.01
+                if self._starvation_ticks > 500:
+                    # FIX: Additive position uncertainty inflation during extended dropout
+                    self.P[0:3, 0:3] += np.eye(3) * (0.01**2)
             return False, 0
         
         fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
@@ -266,7 +288,8 @@ class VIO_EKF:
         if valid.sum() < MIN_FEAT_UPDATE: 
             with self._lock:
                 self._starvation_ticks += 1
-                if self._starvation_ticks > 10: self.P *= 1.01
+                if self._starvation_ticks > 500:
+                    self.P[0:3, 0:3] += np.eye(3) * (0.01**2)
             return False, 0
         
         p_val = pts_p[valid]
@@ -280,7 +303,8 @@ class VIO_EKF:
             if var_x < 1000.0 or var_y < 1000.0:
                 with self._lock:
                     self._starvation_ticks += 1
-                    if self._starvation_ticks > 10: self.P *= 1.01
+                    if self._starvation_ticks > 500:
+                        self.P[0:3, 0:3] += np.eye(3) * (0.01**2)
                 return False, 0
         
         X = (p_val[:, 0] - cx) * d_val / fx
@@ -296,7 +320,8 @@ class VIO_EKF:
         if not success or n_inliers < MIN_FEAT_UPDATE: 
             with self._lock:
                 self._starvation_ticks += 1
-                if self._starvation_ticks > 10: self.P *= 1.01
+                if self._starvation_ticks > 500:
+                    self.P[0:3, 0:3] += np.eye(3) * (0.01**2)
             return False, n_inliers
             
         ni = n_inliers
@@ -350,18 +375,22 @@ class VIO_EKF:
             R_vis_dyn[2, 2] *= depth_scale
             
             S = H @ self.P @ H.T + R_vis_dyn
+            
+            # FIX: Tikhonov regularization for numerical stability
+            lambda_reg = 1e-6
+            S_reg = S + np.eye(6) * lambda_reg
+            
             try: 
-                Si = np.linalg.inv(S)
-            except Exception: 
+                Si = np.linalg.inv(S_reg)
+            except np.linalg.LinAlgError: 
+                print("  [EKF] Covariance matrix is singular. Skipping update.")
                 self._starvation_ticks += 1
                 return False, ni
             
             # --- MAHALANOBIS GATE ---
             mahalanobis_sq = innov.T @ Si @ innov
-            if mahalanobis_sq > 12.59:
+            if mahalanobis_sq > 16.81: # FIX: Stricter gate (16.81 is 99% confidence for 6DOF)
                 self._starvation_ticks += 1
-                if self._starvation_ticks > 10:
-                    self.P *= 1.02 # Aggressive inflation during active rejection
                 return False, ni 
             
             K_gain = self.P @ H.T @ Si
