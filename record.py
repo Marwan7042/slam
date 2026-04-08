@@ -390,6 +390,7 @@ cam.setIspScale(1, 2)
 cam.setFps(TARGET_FPS)
 cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
 cam.setPreviewSize(640, 360)
+cam.setVideoSize(640, 360)
 
 if LOCK_EXPOSURE:
     cam.initialControl.setManualExposure(cam_state["exp"], cam_state["iso"])
@@ -402,6 +403,7 @@ controlIn.out.link(cam.inputControl)
 
 jpeg_enc = pipeline.create(dai.node.VideoEncoder)
 jpeg_enc.setDefaultProfilePreset(TARGET_FPS, dai.VideoEncoderProperties.Profile.MJPEG)
+jpeg_enc.setQuality(80)
 cam.video.link(jpeg_enc.input)
 
 xout_jpeg = pipeline.create(dai.node.XLinkOut)
@@ -625,7 +627,7 @@ with dai.Device(pipeline) as device:
             mj = qj.tryGet()
             if mj:
                 with jpeg_lock: 
-                    latest_jpeg = mj.getData()
+                    latest_jpeg = mj.getData().tobytes()
 
             mp = qp.tryGet()
             if mp:
