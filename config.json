@@ -3,8 +3,8 @@
         "scan_dir": "./coral_scan2"
     },
     "hardware": {
-        "calibration_mode": "custom",
-        "target_fps": 10,
+        "calibration_mode": "factorty",
+        "target_fps": 30,
         "imu_rate_hz": 200,
         "use_ir_projector": true,
         "ir_dot_brightness_ma": 800,
