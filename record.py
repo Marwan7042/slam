@@ -58,12 +58,12 @@ CR_REC = CR_CFG.get("apply_to_recording", True)
 ISP_WIDTH  = 960
 ISP_HEIGHT = 540
 
-# FIX: Optical Flow & Feature Tracker Tuned for Murky Environments
+# Optical Flow & Feature Tracker Tuned for Pi CPU efficiency
 lk_params = dict(
-    winSize=(31, 31),
-    maxLevel=4,
-    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 0.005),
-    minEigThreshold=1e-5
+    winSize=(21, 21),
+    maxLevel=3,
+    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+    minEigThreshold=1e-4
 )
 
 feature_params = dict(
@@ -111,7 +111,6 @@ runtime_state = {"bad_streak_counter": 0}
 # ============================================================
 # ZERO-COPY BUFFERS
 # ============================================================
-# FIX: Pre-allocated buffers strip out 10x overhead on the main thread GIL
 MAX_FEATURES = 150
 pp_buffer = np.empty((MAX_FEATURES, 2), dtype=np.float32)
 pc_buffer = np.empty((MAX_FEATURES, 2), dtype=np.float32)
@@ -131,7 +130,6 @@ def visual_worker(ekf, K_mat, T_ic, T_ci):
         if item is None: 
             break
             
-        # item: (pp_view, pc_view, prev_depth, camera_ts)
         r, n = ekf.update_visual(item[0], item[1], item[2], K_mat, T_ic, T_ci, item[3])
         if r: 
             ok += 1
@@ -256,7 +254,6 @@ class MJPEGHandler(http.server.BaseHTTPRequestHandler):
                     frame = frame_ref.copy() if frame_ref is not None else None
                     
                     if frame is not None:
-                        # FIX: Apply color restore here in the background thread, not the main thread!
                         if CR_ENABLED and CR_HUD:
                             frame = fast_underwater_restore(frame, CR_R_MAX, CR_G_MAX)
                             
@@ -355,7 +352,14 @@ def disk_worker():
             item = disk_queue.get(timeout=0.1)
             if item is None: 
                 break
-            cv2.imwrite(item[0], item[1])
+            filepath, img = item[0], item[1]
+            
+            # Throttled Zlib Compression for PNG Depth Maps
+            if filepath.endswith('.png'):
+                cv2.imwrite(filepath, img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+            else:
+                cv2.imwrite(filepath, img)
+            
             disk_queue.task_done()
         except queue.Empty: 
             continue
@@ -632,8 +636,6 @@ with dai.Device(pipeline) as device:
             mp = qp.tryGet()
             if mp:
                 frame_np = mp.getCvFrame()
-                # FIX: Do not apply fast_underwater_restore here!
-                # Simply store the raw frame reference and let the background HTTP thread process it
                 with hud_lock:
                     latest_preview = frame_np
 
@@ -659,8 +661,8 @@ with dai.Device(pipeline) as device:
                 except AttributeError:
                     rgb_ts = time.monotonic()
                 
-                # FIX: Never feed Color-Restored frames to optical flow/trackers.
-                gray_curr = cv2.cvtColor(raw_rgb, cv2.COLOR_BGR2GRAY)
+                # Zero-Math Grayscale: Extracting the Green channel directly
+                gray_curr = raw_rgb[:, :, 1].copy()
                 
                 if CR_ENABLED and CR_REC:
                     rgb_to_save = fast_underwater_restore(raw_rgb, CR_R_MAX, CR_G_MAX)
@@ -702,8 +704,8 @@ with dai.Device(pipeline) as device:
                     quality_score = 1.0       
                     quality_state = "GOOD"
                     
-                    # FIX: Temporal Gradient (Laplacian Variance) rather than predictive IMU blur
-                    laplacian_var = cv2.Laplacian(gray_curr, cv2.CV_64F).var()
+                    # Optimized Temporal Gradient (Laplacian Variance) using downsampling and float32
+                    laplacian_var = cv2.Laplacian(gray_curr[::4, ::4], cv2.CV_32F).var()
 
                     if gap >= GATE_MAX_FRAME_GAP:
                         accept = True
@@ -718,7 +720,7 @@ with dai.Device(pipeline) as device:
                         if valid_ratio < GATE_MIN_DEPTH_VALID:
                             reason = f"bad_depth({valid_ratio:.2f})"
                         else:
-                            if laplacian_var < 50.0:  # Direct sharpness detection
+                            if laplacian_var < 50.0:
                                 reason = f"blur_laplacian({laplacian_var:.1f})"
                             else:
                                 accept = True
@@ -736,7 +738,6 @@ with dai.Device(pipeline) as device:
                         w_blur = qc_cfg.get("weight_blur", 0.4)
                         
                         q_depth = min(1.0, valid_ratio / ideal_depth) if ideal_depth > 0 else 0
-                        # Convert laplacian to a 0-1 quality score (higher laplacian = better)
                         q_blur  = min(1.0, max(0.0, (laplacian_var - severe_blur_equiv) / 100.0))
                         quality_score = (q_depth * w_depth) + (q_blur * w_blur)
                         
@@ -758,7 +759,7 @@ with dai.Device(pipeline) as device:
                         with hud_lock:
                             hud_telemetry["state"] = quality_state
                             hud_telemetry["score"] = quality_score
-                            hud_telemetry["blur"] = laplacian_var # Outputting Laplacian instead of IMU Blur
+                            hud_telemetry["blur"] = laplacian_var 
                             hud_telemetry["depth_pct"] = valid_ratio
                             
                             if runtime_state["bad_streak_counter"] >= 8:
@@ -827,7 +828,6 @@ with dai.Device(pipeline) as device:
                         if len(pp) >= MIN_FEAT_UPDATE:
                             try: 
                                 n_pts = min(len(pp), MAX_FEATURES)
-                                # FIX: Populate pre-allocated view array buffers safely avoiding GIL array conversion overhead
                                 for i in range(n_pts):
                                     pp_buffer[i, 0] = pp[i][0]
                                     pp_buffer[i, 1] = pp[i][1]
@@ -867,12 +867,11 @@ with dai.Device(pipeline) as device:
                                     good_old, good_new, async_prev_ts = lk_result_queue.get_nowait()
                                     if len(good_new) >= MIN_FEAT_UPDATE:
                                         try:
-                                            # FIX: Flatten views to avoid EKF array slicing crash
                                             good_old_flat = good_old.reshape(-1, 2).copy()
                                             good_new_flat = good_new.reshape(-1, 2).copy()
                                             
                                             visual_queue.put_nowait((good_old_flat, good_new_flat, prev_depth, async_prev_ts))
-                                            fallback_pts_prev = good_new.reshape(-1, 1, 2) # Keep (N,1,2) for next LK iteration
+                                            fallback_pts_prev = good_new.reshape(-1, 1, 2)
                                             telemetry_stats["cpu_fallback_engagements"] += 1
                                         except queue.Full:
                                             telemetry_stats["visual_queue_drops"] += 1

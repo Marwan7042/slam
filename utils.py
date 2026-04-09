@@ -3,6 +3,7 @@ import psutil
 import threading
 import numpy as np
 import cv2
+
 # Numba Auto-Detect
 try:
     from numba import njit
@@ -41,20 +42,24 @@ def mem():
     return s
 
 def fast_underwater_restore(frame, r_max=3.0, g_max=1.2):
-    """Fast channel scaling to recover red/green with soft clipping."""
-    b, g, r = cv2.split(frame)
-
-    b_mean, g_mean, r_mean = np.mean(b), np.mean(g), np.mean(r)
+    """Fast channel scaling to recover red/green with soft clipping using hardware SIMD."""
+    # cv2.mean executes in C++ via NEON SIMD, zero array allocations
+    means = cv2.mean(frame)
+    b_mean, g_mean, r_mean = means[0], means[1], means[2]
 
     # Calculate dynamic scale, bounded by the config limits
     r_scale = min((b_mean / max(r_mean, 1.0)), r_max)
     g_scale = min((b_mean / max(g_mean, 1.0)), g_max)
 
-    # Use float32 for math to prevent integer wrap-around/harsh clipping
-    r_restored = np.clip(r.astype(np.float32) * r_scale, 0, 255).astype(np.uint8)
-    g_restored = np.clip(g.astype(np.float32) * g_scale, 0, 255).astype(np.uint8)
+    # 3x3 transformation matrix applied directly to the image bytes
+    m = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, g_scale, 0.0],
+        [0.0, 0.0, r_scale]
+    ], dtype=np.float32)
 
-    return cv2.merge([b, g_restored, r_restored])
+    # cv2.transform automatically handles bounds clipping at C++ level
+    return cv2.transform(frame, m)
 
 class ETA:
     def __init__(self, n, nm="", ev=20):
@@ -129,7 +134,6 @@ class DepthDoubleBuffer:
         self._lock = threading.Lock()
         
     def write(self, frame):
-        # FIX: Ensure lock protects the idx read to avoid torn reads/writes
         with self._lock:
             wi = self._write_idx
             np.copyto(self._bufs[wi], frame)
